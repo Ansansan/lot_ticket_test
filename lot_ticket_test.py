@@ -5281,13 +5281,19 @@ def build_lista_edit_webapp_url(user_id, draft):
     return f"{WEBAPP_BASE_URL}index.html?{urllib.parse.urlencode(params)}"
 
 
+def get_lista_edit_launch_markup(user_id, draft):
+    edit_url = build_lista_edit_webapp_url(user_id, draft)
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton("📝 Abrir editor /lista", web_app=WebAppInfo(url=edit_url)))
+    return markup
+
+
 def get_lista_preview_markup(user_id, draft):
     draft_id = draft['id']
-    edit_url = build_lista_edit_webapp_url(user_id, draft)
     markup = InlineKeyboardMarkup()
     markup.row(
         InlineKeyboardButton("Confirmar", callback_data=f"lista_confirm_{draft_id}"),
-        InlineKeyboardButton("Editar", web_app=WebAppInfo(url=edit_url)),
+        InlineKeyboardButton("Editar", callback_data=f"lista_edit_{draft_id}"),
         InlineKeyboardButton("Cancelar", callback_data=f"lista_cancel_{draft_id}")
     )
     return markup
@@ -6037,6 +6043,7 @@ def handle_web_app(message):
             )
             if draft_id:
                 update_ticket_draft(draft_id, status='GENERATED', expires_at=None)
+                ensure_menu_button(user_id, chat_id=message.chat.id)
 
         elif action == 'create_ticket':
             # Legacy fallback (in case old JS version is cached)
@@ -6358,6 +6365,8 @@ def handle_lista_callback(call):
         data = call.data or ''
         if data.startswith('lista_confirm_'):
             action = 'confirm'
+        elif data.startswith('lista_edit_'):
+            action = 'edit'
         elif data.startswith('lista_cancel_'):
             action = 'cancel'
         else:
@@ -6375,6 +6384,32 @@ def handle_lista_callback(call):
             return
 
         current_status = draft.get('status')
+        if action == 'edit':
+            if current_status == 'GENERATED':
+                bot.answer_callback_query(call.id, "Ese ticket ya fue generado.")
+                return
+            if current_status == 'EXPIRED':
+                bot.answer_callback_query(call.id, "Ese borrador ya expiró.")
+                return
+            if current_status != 'PREVIEW':
+                bot.answer_callback_query(call.id, "Ese borrador ya no puede editarse.")
+                return
+
+            try:
+                bot.send_message(
+                    call.message.chat.id,
+                    "Abre el editor desde el botón de abajo y luego toca Imprimir dentro del mini app.",
+                    reply_markup=get_lista_edit_launch_markup(call.from_user.id, draft),
+                    reply_to_message_id=call.message.message_id
+                )
+            except Exception as e:
+                print(f"⚠️ Failed to send /lista editor launch keyboard: {e}")
+                bot.answer_callback_query(call.id, "No pude abrir el editor.")
+                return
+
+            bot.answer_callback_query(call.id, "Editor listo en el teclado.")
+            return
+
         if action == 'cancel':
             if current_status == 'GENERATED':
                 bot.answer_callback_query(call.id, "Ese ticket ya fue generado.")
