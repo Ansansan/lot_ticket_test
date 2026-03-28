@@ -270,11 +270,50 @@ def get_db_connection(timeout=30.0):
 
 
 def build_ticket_message_context(chat_id, from_user, reply_message_id=None):
+    chat_first_name = getattr(from_user, 'first_name', None)
+    chat_username = getattr(from_user, 'username', None)
     return SimpleNamespace(
-        chat=SimpleNamespace(id=chat_id),
+        chat=SimpleNamespace(
+            id=chat_id,
+            type='private',
+            first_name=chat_first_name,
+            username=chat_username
+        ),
         from_user=from_user,
         message_id=reply_message_id
     )
+
+
+def send_ticket_media(message, bio, ticket_id, caption_text, reply_markup, width, height):
+    """Send rendered ticket media with compatibility fallbacks for large images/documents."""
+    photo_size = bio.seek(0, 2)
+    bio.seek(0)
+    prefers_document = photo_size > 10 * 1024 * 1024 or (width + height) > 10000
+
+    if not prefers_document:
+        try:
+            return bot.send_photo(message.chat.id, photo=bio, caption=caption_text, reply_markup=reply_markup)
+        except Exception as e:
+            print(f"⚠️ send_photo failed for ticket #{ticket_id}, retrying as document: {e}")
+            bio.seek(0)
+
+    try:
+        return bot.send_document(
+            message.chat.id,
+            document=bio,
+            caption=caption_text,
+            reply_markup=reply_markup,
+            visible_file_name=f"ticket_{ticket_id}.jpg"
+        )
+    except TypeError:
+        # Older pyTelegramBotAPI builds do not support visible_file_name.
+        bio.seek(0)
+        return bot.send_document(
+            message.chat.id,
+            document=bio,
+            caption=caption_text,
+            reply_markup=reply_markup
+        )
 
 
 def remember_message_map(chat_id, user_msg_id, admin_msg_id):
@@ -1864,16 +1903,13 @@ def release_receipt_image_hash(image_hash):
         return False
 
 def format_short_received_time(ts_text):
-    """Format DB timestamp (UTC) as MM-DD HH:MM:SS in Panama time."""
+    """Format DB timestamp (Panama local) as MM-DD HH:MM:SS."""
     if not ts_text:
         return "desconocida"
     raw = str(ts_text).strip().replace('T', ' ')
     try:
         dt = datetime.datetime.fromisoformat(raw)
-        # DB stores UTC – convert to Panama time for display
-        dt_utc = pytz.utc.localize(dt)
-        dt_panama = dt_utc.astimezone(PANAMA_TZ)
-        return dt_panama.strftime("%m-%d %H:%M:%S")
+        return dt.strftime("%m-%d %H:%M:%S")
     except Exception:
         m = re.match(r'^\d{4}-(\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})', raw)
         if m:
@@ -6312,12 +6348,15 @@ def generate_ticket_image(message, ticket_id, date, lottery_type, items):
         delete_markup.add(InlineKeyboardButton("✏️ Editar Ticket", web_app=WebAppInfo(url=edit_url)))
         delete_markup.add(InlineKeyboardButton("🗑️ Cancelar Ticket", callback_data=f"del1_{ticket_id}"))
         caption_text = f"Ticket #{ticket_id} | {lottery_type} {flag_emoji}"
-        photo_size = bio.seek(0, 2)
-        bio.seek(0)
-        if photo_size > 10 * 1024 * 1024 or (width + height) > 10000:
-            sent_msg = bot.send_document(message.chat.id, document=bio, caption=caption_text, reply_markup=delete_markup, visible_file_name=f"ticket_{ticket_id}.jpg")
-        else:
-            sent_msg = bot.send_photo(message.chat.id, photo=bio, caption=caption_text, reply_markup=delete_markup)
+        sent_msg = send_ticket_media(
+            message,
+            bio,
+            ticket_id,
+            caption_text,
+            delete_markup,
+            width,
+            height
+        )
         
         # Store message_id for web app deletion of inline button
         try:
