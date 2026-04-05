@@ -1997,6 +1997,90 @@ def format_confirmation_display(confirmation=None, confirmation_full=None):
     return raw_full or "?"
 
 
+def _normalize_compact_account_tag(account_tag):
+    raw = str(account_tag or "").strip().upper()
+    if not raw or raw == "?":
+        return "?"
+    if not raw.startswith("#"):
+        raw = f"#{raw}"
+    return raw
+
+
+def _lookup_account_tag_from_recipient_name(recipient_name):
+    compact_recipient = re.sub(r'\s+', '', str(recipient_name or "").strip()).casefold()
+    if not compact_recipient:
+        return None
+    for account_tag, account_name in YAPPY_ACCOUNTS.items():
+        compact_account_name = re.sub(r'\s+', '', str(account_name or "").strip()).casefold()
+        if compact_account_name == compact_recipient:
+            return _normalize_compact_account_tag(account_tag)
+    return None
+
+
+def _normalize_receipt_sender_token(receipt_sender_name):
+    compact = re.sub(r'\s+', '', str(receipt_sender_name or "").strip())
+    if not compact or compact == "?":
+        return "?"
+    return f"#{compact[:3]}"
+
+
+def _parse_compact_ocr_status_text(text):
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    parts = raw.split()
+    if len(parts) >= 7 and parts[2].startswith("$"):
+        return {
+            'status_icon': parts[0],
+            'payment_time': parts[1],
+            'amount_text': parts[2],
+            'payment_sender_name': parts[3],
+            'account_tag': parts[4],
+            'receipt_sender_token': parts[5],
+            'confirmation_token': parts[6],
+            'issue_tag': parts[7] if len(parts) > 7 else None
+        }
+    sender_name = None
+    for line in raw.splitlines():
+        if line.startswith("Enviado por:"):
+            sender_name = line.split(":", 1)[1].strip()
+            break
+    return {'receipt_sender_name': sender_name} if sender_name else {}
+
+
+def build_compact_ocr_status_line(
+    status_icon,
+    payment_time,
+    amount,
+    payment_sender_name,
+    account_tag,
+    receipt_sender_name,
+    confirmation=None,
+    confirmation_full=None,
+    include_issue_tag=False
+):
+    """Build a ws-to-tg style one-line OCR status notification."""
+    try:
+        amount_text = f"${float(amount):.2f}"
+    except Exception:
+        amount_text = f"${amount}" if amount is not None else "$?"
+
+    time_text = str(payment_time or "?").strip() or "?"
+    sender_compact = re.sub(r'\s+', '', str(payment_sender_name or "").strip()) or "?"
+    account_text = _normalize_compact_account_tag(account_tag)
+    confirmation_text = format_confirmation_display(
+        confirmation=confirmation,
+        confirmation_full=confirmation_full
+    )
+    confirmation_token = f"#{confirmation_text}" if confirmation_text != "?" else "?"
+    receipt_sender_token = _normalize_receipt_sender_token(receipt_sender_name)
+
+    msg = f"{status_icon}  {time_text} {amount_text} {sender_compact} {account_text} {receipt_sender_token} {confirmation_token}"
+    if include_issue_tag:
+        msg += " #问题"
+    return msg
+
+
 def build_receipt_manual_webapp_url(followup_id, amount=None, confirmation=None, confirmation_full=None, receipt_time=None):
     params = {
         "v": BOT_VERSION,
@@ -2216,12 +2300,13 @@ def disable_receipt_followup_buttons(followup):
         return False
 
 
-def edit_receipt_followup_message(followup, text, parse_mode=None, reply_markup=None):
+def edit_receipt_followup_message(followup, text, parse_mode=None, reply_markup=None, append_edited_note=True):
     if not followup or not followup.get('action_message_id') or text is None:
         return False
     try:
+        message_text = text + "\n_(Editado por el bot)_" if append_edited_note else text
         bot.edit_message_text(
-            text + "\n_(Editado por el bot)_",
+            message_text,
             followup['chat_id'],
             followup['action_message_id'],
             parse_mode=parse_mode,
@@ -2425,27 +2510,26 @@ def process_manual_receipt_submission(followup, amount, confirmation, confirmati
         'confirmation_full': confirmation_full or f"#{confirmation}",
         'time': receipt_time or None
     }
-    confirmation_display = format_confirmation_display(
-        confirmation=payment_info.get('confirmation'),
-        confirmation_full=payment_info.get('confirmation_full')
-    )
     match = search_yappy_payment(payment_info)
 
     if isinstance(match, tuple) and match[0] == "ALREADY_VERIFIED":
         verified_payment = match[1]
-        verified_at = verified_payment[10] if len(verified_payment) > 10 else None
-        verified_at_text = verified_at if verified_at else "desconocida"
-        msg = (
-            f"🟡 **Comprobante ya procesado**\n"
-            f"Pago: {confirmation_display}\n"
-            f"Monto: ${verified_payment[3]:.2f}\n"
-            f"Recibido: {verified_at_text}"
+        msg = build_compact_ocr_status_line(
+            status_icon="🟡",
+            payment_time=verified_payment[2] if len(verified_payment) > 2 else receipt_time,
+            amount=verified_payment[3] if len(verified_payment) > 3 else amount,
+            payment_sender_name=verified_payment[4] if len(verified_payment) > 4 else "?",
+            account_tag=verified_payment[7] if len(verified_payment) > 7 else "?",
+            receipt_sender_name=lookup_support_user_name(user_id),
+            confirmation=confirmation,
+            confirmation_full=payment_info.get('confirmation_full'),
+            include_issue_tag=True
         )
         if edit_receipt_followup_message(
             followup,
             msg,
-            parse_mode="Markdown",
-            reply_markup=get_receipt_processed_markup()
+            reply_markup=get_receipt_processed_markup(),
+            append_edited_note=False
         ):
             mirror_receipt_followup_action_message(followup)
         update_receipt_followup(
@@ -2483,17 +2567,22 @@ def process_manual_receipt_submission(followup, amount, confirmation, confirmati
             )
             return False
 
-        amount_text = f"${amount:.2f}" if amount is not None else "?"
-        msg = (
-            f"🔵 **Verificando pago...**\n"
-            f"Monto: {amount_text}\n"
-            f"Confirmación: {confirmation_display}"
+        msg = build_compact_ocr_status_line(
+            status_icon="🔵",
+            payment_time=receipt_time,
+            amount=amount,
+            payment_sender_name="?",
+            account_tag="?",
+            receipt_sender_name=lookup_support_user_name(user_id),
+            confirmation=confirmation,
+            confirmation_full=payment_info.get('confirmation_full'),
+            include_issue_tag=True
         )
         if edit_receipt_followup_message(
             followup,
             msg,
-            parse_mode="Markdown",
-            reply_markup=get_receipt_processed_markup()
+            reply_markup=get_receipt_processed_markup(),
+            append_edited_note=False
         ):
             mirror_receipt_followup_action_message(followup)
         else:
@@ -2515,7 +2604,6 @@ def process_manual_receipt_submission(followup, amount, confirmation, confirmati
     db_amount = match[3]
     db_sender = match[4]
     account_tag = match[7]
-    account_name = YAPPY_ACCOUNTS.get(account_tag, account_tag)
 
     if not mark_payment_verified(payment_id, user_id=user_id):
         edit_receipt_followup_message(
@@ -2531,27 +2619,24 @@ def process_manual_receipt_submission(followup, amount, confirmation, confirmati
         )
         return False
 
-    if is_admin_user(user_id):
-        wallet_summary = ""
-    else:
-        wallet_summary = process_wallet_deposit(user_id, db_amount)
-        wallet_summary = sanitize_wallet_summary_for_ocr(wallet_summary)
-
-    msg = (
-        f"✅ **Pago Verificado**\n"
-        f"Monto: ${db_amount:.2f}\n"
-        f"Hora: {db_time}\n"
-        f"De: {db_sender}\n"
-        f"Cuenta: {account_name}"
+    if not is_admin_user(user_id):
+        process_wallet_deposit(user_id, db_amount)
+    msg = build_compact_ocr_status_line(
+        status_icon="✅",
+        payment_time=db_time,
+        amount=db_amount,
+        payment_sender_name=db_sender,
+        account_tag=account_tag,
+        receipt_sender_name=lookup_support_user_name(user_id),
+        confirmation=confirmation,
+        confirmation_full=payment_info.get('confirmation_full')
     )
-    if wallet_summary:
-        msg += "\n" + wallet_summary
 
     if edit_receipt_followup_message(
         followup,
         msg,
-        parse_mode="Markdown",
-        reply_markup=get_receipt_processed_markup()
+        reply_markup=get_receipt_processed_markup(),
+        append_edited_note=False
     ):
         mirror_receipt_followup_action_message(followup)
     else:
@@ -2638,19 +2723,17 @@ def check_and_notify_pending(payment_data, payment_id):
             # SUCCESS! Matches.
             try:
                 # 💰 WALLET DEPOSIT — skip for admin users (no fondo needed)
-                if is_admin_user(user_id):
-                    wallet_summary = ""
-                else:
-                    wallet_summary = process_wallet_deposit(user_id, amount)
-                    wallet_summary = sanitize_wallet_summary_for_ocr(wallet_summary)
-
-                msg = (f"✅ **Pago Verificado**\n\n"
-                       f"Monto: ${amount:.2f}\n"
-                       f"Confirmación: {format_confirmation_display(confirmation=confirmation)}\n"
-                       f"De: {payment_data['sender_name']}\n"
-                       f"Hora: {payment_time}")
-                if wallet_summary:
-                    msg += f"\n{wallet_summary}"
+                if not is_admin_user(user_id):
+                    process_wallet_deposit(user_id, amount)
+                msg = build_compact_ocr_status_line(
+                    status_icon="✅",
+                    payment_time=payment_time,
+                    amount=amount,
+                    payment_sender_name=payment_data.get('sender_name'),
+                    account_tag=payment_data.get('account_tag'),
+                    receipt_sender_name=lookup_support_user_name(user_id),
+                    confirmation=confirmation
+                )
 
                 followup = get_receipt_followup(followup_id) if followup_id else None
                 edited_existing_followup = False
@@ -2658,8 +2741,8 @@ def check_and_notify_pending(payment_data, payment_id):
                     edited_existing_followup = edit_receipt_followup_message(
                         followup,
                         msg,
-                        parse_mode="Markdown",
-                        reply_markup=get_receipt_processed_markup()
+                        reply_markup=get_receipt_processed_markup(),
+                        append_edited_note=False
                     )
                     if edited_existing_followup:
                         mirror_receipt_followup_action_message(followup)
@@ -2669,10 +2752,9 @@ def check_and_notify_pending(payment_data, payment_id):
                 if not edited_existing_followup and reply_message_id and chat_id:
                     try:
                         bot.edit_message_text(
-                            msg + "\n_(Editado por el bot)_",
+                            msg,
                             chat_id,
-                            reply_message_id,
-                            parse_mode="Markdown"
+                            reply_message_id
                         )
                         edited_existing_followup = True
                     except Exception as e:
@@ -2681,12 +2763,12 @@ def check_and_notify_pending(payment_data, payment_id):
                 if not edited_existing_followup:
                     if message_id:
                         try:
-                            sent_msg = bot.send_message(chat_id, msg, reply_to_message_id=message_id, parse_mode="Markdown")
+                            sent_msg = bot.send_message(chat_id, msg, reply_to_message_id=message_id)
                         except Exception as e:
                             print(f"⚠️ Reply-to send failed for pending verification {req_id}: {e}")
-                            sent_msg = bot.send_message(chat_id, msg, parse_mode="Markdown")
+                            sent_msg = bot.send_message(chat_id, msg)
                     else:
-                        sent_msg = bot.send_message(chat_id, msg, parse_mode="Markdown")
+                        sent_msg = bot.send_message(chat_id, msg)
 
                     mirror_to_topic(chat_id, sent_msg)
                     if followup_id:
@@ -4692,37 +4774,41 @@ def handle_channel_confirmation_correction(message):
             db_amount = match[3]
             db_sender = match[4]
             account_tag = match[7]
-            account_name = YAPPY_ACCOUNTS.get(account_tag, account_tag)
 
             if not mark_payment_verified(payment_id, user_id=user_id or None):
                 bot.reply_to(message, "❌ No pude finalizar la verificación.")
                 return
 
-            wallet_summary = ""
             if user_id and not is_admin_user(user_id):
-                wallet_summary = process_wallet_deposit(user_id, db_amount)
-                wallet_summary = sanitize_wallet_summary_for_ocr(wallet_summary)
-
-            success_msg = (
-                f"✅ **Pago Verificado**\n\n"
-                f"Monto: ${db_amount:.2f}\n"
-                f"Confirmación: {format_confirmation_display(confirmation=confirmation)}\n"
-                f"De: {db_sender}\n"
-                f"Hora: {db_time}"
+                process_wallet_deposit(user_id, db_amount)
+            orig_text = (message.reply_to_message.text or "") if message.reply_to_message else ""
+            parsed_status = _parse_compact_ocr_status_text(orig_text)
+            receipt_sender_name = (
+                str(parsed_status.get('receipt_sender_token') or "").lstrip('#')
+                or parsed_status.get('receipt_sender_name')
+                or lookup_support_user_name(user_id)
             )
-            if wallet_summary:
-                success_msg += f"\n{wallet_summary}"
+
+            success_msg = build_compact_ocr_status_line(
+                status_icon="✅",
+                payment_time=db_time,
+                amount=db_amount,
+                payment_sender_name=db_sender,
+                account_tag=account_tag,
+                receipt_sender_name=receipt_sender_name,
+                confirmation=confirmation,
+                confirmation_full=confirmation_full
+            )
 
             try:
                 bot.edit_message_text(
-                    success_msg + "\n_(Editado por el bot)_",
+                    success_msg,
                     chat_id,
-                    replied_msg_id,
-                    parse_mode="Markdown"
+                    replied_msg_id
                 )
             except Exception as e:
                 print(f"⚠️ Failed to edit blue message after correction: {e}")
-                bot.reply_to(message, success_msg, parse_mode="Markdown")
+                bot.reply_to(message, success_msg)
 
             # Remove from pending
             conn = get_yappy_db()
@@ -4735,31 +4821,30 @@ def handle_channel_confirmation_correction(message):
                 complete_receipt_followup(followup_id, status="PROCESSED")
 
         else:
-            # No payment match yet — edit blue message with corrected code, remove #问题
-            conf_display = format_confirmation_display(confirmation=confirmation, confirmation_full=confirmation_full)
-            # Try to preserve sender name from original blue message
-            sender_line = ""
             orig_text = (message.reply_to_message.text or "") if message.reply_to_message else ""
-            for line in orig_text.split("\n"):
-                if line.startswith("Enviado por:"):
-                    sender_line = line
-                    break
-
-            updated_msg = (
-                f"🔵 **Verificando pago...**\n"
-                f"Monto: ${amount:.2f}\n"
-                f"Confirmación: {conf_display}"
+            parsed_status = _parse_compact_ocr_status_text(orig_text)
+            receipt_sender_name = (
+                str(parsed_status.get('receipt_sender_token') or "").lstrip('#')
+                or parsed_status.get('receipt_sender_name')
+                or lookup_support_user_name(user_id)
             )
-            if sender_line:
-                updated_msg += f"\n{sender_line}"
-            updated_msg += "\n_(Código corregido)_"
+            updated_msg = build_compact_ocr_status_line(
+                status_icon="🔵",
+                payment_time=receipt_time,
+                amount=amount,
+                payment_sender_name=parsed_status.get('payment_sender_name') or "?",
+                account_tag=parsed_status.get('account_tag') or "?",
+                receipt_sender_name=receipt_sender_name,
+                confirmation=confirmation,
+                confirmation_full=confirmation_full,
+                include_issue_tag=True
+            )
 
             try:
                 bot.edit_message_text(
                     updated_msg,
                     chat_id,
-                    replied_msg_id,
-                    parse_mode="Markdown"
+                    replied_msg_id
                 )
             except Exception as e:
                 print(f"⚠️ Failed to edit blue message for correction: {e}")
@@ -4952,27 +5037,23 @@ def process_ocr_task(message, temp_path, image_hash=None):
         if isinstance(match, tuple) and match[0] == "ALREADY_VERIFIED":
             keep_receipt_hash = True
             verified_payment = match[1]
-            conf_display = format_confirmation_display(
-                confirmation=payment_info.get('confirmation'),
-                confirmation_full=payment_info.get('confirmation_full')
-            )
-            verified_at = verified_payment[10] if len(verified_payment) > 10 else None
-            verified_at_text = verified_at if verified_at else "desconocida"
             
             # Get Menu Markup
             markup = get_menu_markup(user_id)
 
-            ya_procesado_msg = (
-                f"🟡 **Comprobante ya procesado**\n"
-                f"Pago: {conf_display}\n"
-                f"Monto: ${verified_payment[3]:.2f}\n"
-                f"Recibido: {verified_at_text}"
+            ya_procesado_msg = build_compact_ocr_status_line(
+                status_icon="🟡",
+                payment_time=verified_payment[2] if len(verified_payment) > 2 else payment_info.get('time'),
+                amount=verified_payment[3] if len(verified_payment) > 3 else payment_info.get('amount'),
+                payment_sender_name=verified_payment[4] if len(verified_payment) > 4 else payment_info.get('sender_name'),
+                account_tag=verified_payment[7] if len(verified_payment) > 7 else "?",
+                receipt_sender_name=user_name,
+                confirmation=payment_info.get('confirmation'),
+                confirmation_full=payment_info.get('confirmation_full'),
+                include_issue_tag=True
             )
-            if is_admin_user(user_id):
-                ya_procesado_msg += "\n#问题"
             bot.reply_to(message,
                         ya_procesado_msg,
-                        parse_mode="Markdown",
                         reply_markup=markup)
             return
 
@@ -4992,22 +5073,21 @@ def process_ocr_task(message, temp_path, image_hash=None):
             keep_receipt_hash = True
 
             # Pending Message
-            conf_display = format_confirmation_display(
+            blue_text = build_compact_ocr_status_line(
+                status_icon="🔵",
+                payment_time=payment_info.get('time'),
+                amount=payment_info.get('amount'),
+                payment_sender_name=payment_info.get('sender_name'),
+                account_tag=_lookup_account_tag_from_recipient_name(payment_info.get('recipient_name')) or "?",
+                receipt_sender_name=user_name,
                 confirmation=payment_info.get('confirmation'),
-                confirmation_full=payment_info.get('confirmation_full')
+                confirmation_full=payment_info.get('confirmation_full'),
+                include_issue_tag=True
             )
-            blue_text = (
-                f"🔵 **Verificando pago...**\n"
-                f"Monto: ${payment_info['amount']:.2f}\n"
-                f"Confirmación: {conf_display}"
-            )
-            if is_admin_user(user_id):
-                blue_text += "\n#问题"
             send_receipt_followup_reply(
                 message,
                 blue_text,
                 scenario="PENDING_PAYMENT",
-                parse_mode="Markdown",
                 confirmation=payment_info.get('confirmation'),
                 confirmation_full=payment_info.get('confirmation_full'),
                 amount=payment_info.get('amount'),
@@ -5023,7 +5103,6 @@ def process_ocr_task(message, temp_path, image_hash=None):
         db_amount = match[3]
         db_sender = match[4]
         account_tag = match[7]
-        account_name = YAPPY_ACCOUNTS.get(account_tag, account_tag)
         
         # Mark as verified
         if not mark_payment_verified(payment_id, user_id=user_id):
@@ -5032,29 +5111,25 @@ def process_ocr_task(message, temp_path, image_hash=None):
         keep_receipt_hash = True
 
         # 💰 PROCESS WALLET DEPOSIT — skip for admin users (no fondo needed)
-        if is_admin_user(user_id):
-            wallet_summary = ""
-        else:
-            wallet_summary = process_wallet_deposit(user_id, db_amount)
-            wallet_summary = sanitize_wallet_summary_for_ocr(wallet_summary)
+        if not is_admin_user(user_id):
+            process_wallet_deposit(user_id, db_amount)
         
-        # Send success message (SINGLE MESSAGE)
-        success_msg = (
-            f"✅ **Pago Verificado**\n"
-            f"Monto: ${db_amount:.2f}\n"
-            f"Hora: {db_time}\n"
-            f"De: {db_sender}\n"
-            f"Cuenta: {account_name}"
+        success_msg = build_compact_ocr_status_line(
+            status_icon="✅",
+            payment_time=db_time,
+            amount=db_amount,
+            payment_sender_name=db_sender,
+            account_tag=account_tag,
+            receipt_sender_name=user_name,
+            confirmation=payment_info.get('confirmation'),
+            confirmation_full=payment_info.get('confirmation_full')
         )
-        
-        if wallet_summary:
-            success_msg += "\n" + wallet_summary
         
         # Get Menu Markup
         markup = get_menu_markup(user_id)
 
         # Use reply_to instead of edit_message_text since we didn't send an initial message
-        sent_msg = bot.reply_to(message, success_msg, parse_mode="Markdown", reply_markup=markup)
+        sent_msg = bot.reply_to(message, success_msg, reply_markup=markup)
         mirror_to_topic(message.chat.id, sent_msg, user_name=user_name)
         
     except Exception as e:
@@ -5176,37 +5251,38 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
         if isinstance(match, tuple) and match[0] == "ALREADY_VERIFIED":
             keep_receipt_hash = True
             verified_payment = match[1]
-            conf_display = format_confirmation_display(
-                confirmation=payment_info.get('confirmation'),
-                confirmation_full=payment_info.get('confirmation_full')
-            )
-            verified_at = verified_payment[10] if len(verified_payment) > 10 else None
             bot.reply_to(
                 message,
-                f"🟡 **Comprobante ya procesado**\n"
-                f"Pago: {conf_display}\n"
-                f"Monto: ${verified_payment[3]:.2f}\n"
-                f"Recibido: {verified_at or 'desconocida'}\n"
-                f"#问题",
-                parse_mode="Markdown"
+                build_compact_ocr_status_line(
+                    status_icon="🟡",
+                    payment_time=verified_payment[2] if len(verified_payment) > 2 else payment_info.get('time'),
+                    amount=verified_payment[3] if len(verified_payment) > 3 else payment_info.get('amount'),
+                    payment_sender_name=verified_payment[4] if len(verified_payment) > 4 else payment_info.get('sender_name'),
+                    account_tag=verified_payment[7] if len(verified_payment) > 7 else "?",
+                    receipt_sender_name=sender_name,
+                    confirmation=payment_info.get('confirmation'),
+                    confirmation_full=payment_info.get('confirmation_full'),
+                    include_issue_tag=True
+                )
             )
             return
 
         # Not found — add to pending so it auto-matches when the payment arrives
         if not match:
-            conf_display = format_confirmation_display(
-                confirmation=payment_info.get('confirmation'),
-                confirmation_full=payment_info.get('confirmation_full')
-            )
             # Send blue reply FIRST so we can capture its message_id for later editing
             blue_reply = bot.reply_to(
                 message,
-                f"🔵 **Verificando pago...**\n"
-                f"Monto: ${payment_info['amount']:.2f}\n"
-                f"Confirmación: {conf_display}\n"
-                f"Enviado por: {sender_name}\n"
-                f"#问题",
-                parse_mode="Markdown"
+                build_compact_ocr_status_line(
+                    status_icon="🔵",
+                    payment_time=payment_info.get('time'),
+                    amount=payment_info.get('amount'),
+                    payment_sender_name=payment_info.get('sender_name'),
+                    account_tag=_lookup_account_tag_from_recipient_name(payment_info.get('recipient_name')) or "?",
+                    receipt_sender_name=sender_name,
+                    confirmation=payment_info.get('confirmation'),
+                    confirmation_full=payment_info.get('confirmation_full'),
+                    include_issue_tag=True
+                )
             )
             blue_reply_id = blue_reply.message_id if blue_reply else None
             pending_id = add_pending_verification(
@@ -5241,7 +5317,6 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
         db_amount = match[3]
         db_sender = match[4]
         account_tag = match[7]
-        account_name = YAPPY_ACCOUNTS.get(account_tag, account_tag)
 
         if not mark_payment_verified(payment_id, user_id=sender_user_id or None):
             bot.reply_to(message, "❌ No pude finalizar la verificación del pago.")
@@ -5249,17 +5324,19 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
         keep_receipt_hash = True
 
         # Wallet deposit only if we know the real sender
-        wallet_summary = ""
         if sender_user_id and not is_admin_user(sender_user_id):
-            wallet_summary = process_wallet_deposit(sender_user_id, db_amount)
-            wallet_summary = sanitize_wallet_summary_for_ocr(wallet_summary)
+            process_wallet_deposit(sender_user_id, db_amount)
 
-        confirmation = payment_info.get('confirmation', '?')
-        sender_short = sender_name[:3] if sender_name else "?"
-        sender_compact = db_sender.replace(" ", "")
-        success_msg = f"✅  {db_time} ${db_amount:.2f} {sender_compact} {account_tag} #{sender_short} #{confirmation}"
-        if wallet_summary:
-            success_msg += "\n" + wallet_summary
+        success_msg = build_compact_ocr_status_line(
+            status_icon="✅",
+            payment_time=db_time,
+            amount=db_amount,
+            payment_sender_name=db_sender,
+            account_tag=account_tag,
+            receipt_sender_name=sender_name,
+            confirmation=payment_info.get('confirmation'),
+            confirmation_full=payment_info.get('confirmation_full')
+        )
 
         bot.reply_to(message, success_msg)
 
