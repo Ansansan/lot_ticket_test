@@ -1279,6 +1279,11 @@ def init_yappy_db():
                  first_user_id INTEGER,
                  first_user_name TEXT,
                  receipt_kind TEXT,
+                 receipt_time TEXT,
+                 receipt_amount REAL,
+                 payment_sender_name TEXT,
+                 account_tag TEXT,
+                 confirmation_letters TEXT,
                  first_chat_id INTEGER,
                  first_message_id INTEGER
     )''')
@@ -1316,6 +1321,22 @@ def init_yappy_db():
         pass
     try:
         c.execute("ALTER TABLE receipt_images ADD COLUMN confirmation_letters TEXT")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE receipt_images ADD COLUMN receipt_time TEXT")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE receipt_images ADD COLUMN receipt_amount REAL")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE receipt_images ADD COLUMN payment_sender_name TEXT")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE receipt_images ADD COLUMN account_tag TEXT")
     except:
         pass
 
@@ -1789,10 +1810,10 @@ def sanitize_wallet_summary_for_ocr(summary_text):
 def register_receipt_image_hash(image_hash, user_id, chat_id, message_id, user_name=None):
     """
     Register an OCR receipt image hash.
-    Returns: (is_duplicate, first_seen_at_str, inserted_now, first_user_name, receipt_kind, confirmation_letters)
+    Returns: (is_duplicate, first_seen_at_str, inserted_now, first_user_name, receipt_kind, confirmation_letters, cached_display_fields)
     """
     if not image_hash:
-        return False, None, False, None, None, None
+        return False, None, False, None, None, None, None
     try:
         now_panama = datetime.datetime.now(PANAMA_TZ).strftime("%Y-%m-%d %H:%M:%S")
         safe_user_name = format_topic_user_name(user_id, user_name=user_name)
@@ -1808,10 +1829,12 @@ def register_receipt_image_hash(image_hash, user_id, chat_id, message_id, user_n
         conn.commit()
         if inserted:
             conn.close()
-            return False, now_panama, True, safe_user_name, None, None
+            return False, now_panama, True, safe_user_name, None, None, None
 
         c.execute(
-            "SELECT first_seen_at, first_user_id, first_user_name, receipt_kind, confirmation_letters FROM receipt_images WHERE image_hash = ?",
+            """SELECT first_seen_at, first_user_id, first_user_name, receipt_kind, confirmation_letters,
+                      receipt_time, receipt_amount, payment_sender_name, account_tag
+               FROM receipt_images WHERE image_hash = ?""",
             (image_hash,)
         )
         row = c.fetchone()
@@ -1820,15 +1843,30 @@ def register_receipt_image_hash(image_hash, user_id, chat_id, message_id, user_n
         stored_user_name = row[2] if row and len(row) > 2 else None
         stored_receipt_kind = row[3] if row and len(row) > 3 else None
         stored_confirmation = row[4] if row and len(row) > 4 else None
+        cached_display_fields = {
+            'receipt_time': row[5] if row and len(row) > 5 else None,
+            'receipt_amount': row[6] if row and len(row) > 6 else None,
+            'payment_sender_name': row[7] if row and len(row) > 7 else None,
+            'account_tag': row[8] if row and len(row) > 8 else None,
+            'confirmation_letters': stored_confirmation
+        }
         resolved_user_name = (
             (stored_user_name.strip() if isinstance(stored_user_name, str) and stored_user_name.strip() else None)
             or lookup_support_user_name(stored_user_id)
             or (format_topic_user_name(stored_user_id) if stored_user_id else None)
         )
-        return True, (row[0] if row and row[0] else now_panama), False, resolved_user_name, stored_receipt_kind, stored_confirmation
+        return (
+            True,
+            (row[0] if row and row[0] else now_panama),
+            False,
+            resolved_user_name,
+            stored_receipt_kind,
+            stored_confirmation,
+            cached_display_fields
+        )
     except Exception as e:
         print(f"⚠️ Receipt hash registration failed: {e}")
-        return False, None, False, None, None, None
+        return False, None, False, None, None, None, None
 
 
 def set_receipt_image_kind(image_hash, receipt_kind):
@@ -1871,19 +1909,83 @@ def set_receipt_image_confirmation(image_hash, confirmation_letters):
         return False
 
 
-def build_duplicate_receipt_notice(first_seen_at, first_sender_name, receipt_kind=None, confirmation_letters=None):
+def _normalize_receipt_cache_text(value):
+    cleaned = str(value or "").strip()
+    if not cleaned or cleaned == "?":
+        return None
+    return cleaned
+
+
+def set_receipt_image_display_fields(image_hash, payment_info=None, account_tag=None):
+    """Cache compact duplicate-notice fields for a successfully processed receipt image."""
+    if not image_hash:
+        return False
+
+    info = payment_info or {}
+    resolved_confirmation = _normalize_receipt_cache_text(info.get('confirmation'))
+    resolved_time = _normalize_receipt_cache_text(info.get('time'))
+    resolved_sender_name = _normalize_receipt_cache_text(info.get('sender_name'))
+    resolved_account_tag = _normalize_compact_account_tag(
+        account_tag or info.get('account_tag') or _lookup_account_tag_from_recipient_name(info.get('recipient_name'))
+    )
+    if resolved_account_tag == "?":
+        resolved_account_tag = None
+
+    resolved_amount = info.get('amount')
+    try:
+        resolved_amount = float(resolved_amount) if resolved_amount is not None else None
+    except Exception:
+        resolved_amount = None
+
+    if not any([resolved_confirmation, resolved_time, resolved_sender_name, resolved_account_tag, resolved_amount is not None]):
+        return False
+
+    try:
+        conn = get_yappy_db()
+        c = conn.cursor()
+        c.execute(
+            """UPDATE receipt_images
+               SET confirmation_letters = COALESCE(confirmation_letters, ?),
+                   receipt_time = COALESCE(receipt_time, ?),
+                   receipt_amount = COALESCE(receipt_amount, ?),
+                   payment_sender_name = COALESCE(payment_sender_name, ?),
+                   account_tag = COALESCE(account_tag, ?)
+               WHERE image_hash = ?""",
+            (
+                resolved_confirmation,
+                resolved_time,
+                resolved_amount,
+                resolved_sender_name,
+                resolved_account_tag,
+                image_hash
+            )
+        )
+        updated = c.rowcount > 0
+        conn.commit()
+        conn.close()
+        return updated
+    except Exception as e:
+        print(f"⚠️ Receipt display-field update failed: {e}")
+        return False
+
+
+def build_duplicate_receipt_notice(current_sender_name, receipt_kind=None, cached_display_fields=None):
     """Build the duplicate-image notice shown before OCR reruns."""
-    when_text = format_short_received_time(first_seen_at)
-    sender_text = first_sender_name or "Nombre no disponible"
     if receipt_kind == "MONEY_REQUEST":
-        lines = ["🔴 **Imagen de pedido ya recibida antes**", "No es comprobante de envio, sino de pedido."]
-    else:
-        lines = ["🟡 **Comprobante ya recibido antes**"]
-    if confirmation_letters:
-        lines.append(f"Confirmación: #{confirmation_letters}")
-    lines.append(f"Primero enviado por: {sender_text}")
-    lines.append(f"Recibido por primera vez: {when_text}.")
-    return "\n".join(lines)
+        return "🔴 Imagen de pedido ya recibida antes\nNo es comprobante de envio, sino de pedido."
+
+    cached = cached_display_fields or {}
+    return build_compact_ocr_status_line(
+        status_icon="🟡",
+        description_line="Comprobante ya recibido antes",
+        payment_time=cached.get('receipt_time'),
+        amount=cached.get('receipt_amount'),
+        payment_sender_name=cached.get('payment_sender_name'),
+        account_tag=cached.get('account_tag'),
+        receipt_sender_name=current_sender_name,
+        confirmation=cached.get('confirmation_letters'),
+        include_issue_tag=True
+    )
 
 
 def release_receipt_image_hash(image_hash):
@@ -2028,7 +2130,9 @@ def _parse_compact_ocr_status_text(text):
     raw = str(text or "").strip()
     if not raw:
         return {}
-    parts = raw.split()
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    detail_line = lines[-1] if lines else raw
+    parts = detail_line.split()
     if len(parts) >= 7 and parts[2].startswith("$"):
         return {
             'status_icon': parts[0],
@@ -2038,7 +2142,8 @@ def _parse_compact_ocr_status_text(text):
             'account_tag': parts[4],
             'receipt_sender_token': parts[5],
             'confirmation_token': parts[6],
-            'issue_tag': parts[7] if len(parts) > 7 else None
+            'issue_tag': parts[7] if len(parts) > 7 else None,
+            'description_line': lines[0] if len(lines) > 1 else None
         }
     sender_name = None
     for line in raw.splitlines():
@@ -2055,6 +2160,7 @@ def build_compact_ocr_status_line(
     payment_sender_name,
     account_tag,
     receipt_sender_name,
+    description_line=None,
     confirmation=None,
     confirmation_full=None,
     include_issue_tag=False
@@ -2075,10 +2181,12 @@ def build_compact_ocr_status_line(
     confirmation_token = f"#{confirmation_text}" if confirmation_text != "?" else "?"
     receipt_sender_token = _normalize_receipt_sender_token(receipt_sender_name)
 
-    msg = f"{status_icon}  {time_text} {amount_text} {sender_compact} {account_text} {receipt_sender_token} {confirmation_token}"
+    detail_line = f"{status_icon}  {time_text} {amount_text} {sender_compact} {account_text} {receipt_sender_token} {confirmation_token}"
     if include_issue_tag:
-        msg += " #问题"
-    return msg
+        detail_line += " #问题"
+    if description_line:
+        return f"{status_icon} {description_line}\n{detail_line}"
+    return detail_line
 
 
 def build_receipt_manual_webapp_url(followup_id, amount=None, confirmation=None, confirmation_full=None, receipt_time=None):
@@ -2516,6 +2624,7 @@ def process_manual_receipt_submission(followup, amount, confirmation, confirmati
         verified_payment = match[1]
         msg = build_compact_ocr_status_line(
             status_icon="🟡",
+            description_line="Comprobante ya procesado",
             payment_time=verified_payment[2] if len(verified_payment) > 2 else receipt_time,
             amount=verified_payment[3] if len(verified_payment) > 3 else amount,
             payment_sender_name=verified_payment[4] if len(verified_payment) > 4 else "?",
@@ -2569,6 +2678,7 @@ def process_manual_receipt_submission(followup, amount, confirmation, confirmati
 
         msg = build_compact_ocr_status_line(
             status_icon="🔵",
+            description_line="Verificando pago...",
             payment_time=receipt_time,
             amount=amount,
             payment_sender_name="?",
@@ -4830,6 +4940,7 @@ def handle_channel_confirmation_correction(message):
             )
             updated_msg = build_compact_ocr_status_line(
                 status_icon="🔵",
+                description_line="Verificando pago...",
                 payment_time=receipt_time,
                 amount=amount,
                 payment_sender_name=parsed_status.get('payment_sender_name') or "?",
@@ -4943,7 +5054,7 @@ def process_ocr_task(message, temp_path, image_hash=None):
 
         # Reserve the image hash BEFORE expensive OCR calls. If OCR/parsing fails,
         # the reservation is released in finally so the same screenshot can be retried.
-        is_duplicate_image, first_seen_at, hash_reserved, first_sender_name, first_receipt_kind, first_confirmation = register_receipt_image_hash(
+        is_duplicate_image, first_seen_at, hash_reserved, first_sender_name, first_receipt_kind, first_confirmation, cached_display_fields = register_receipt_image_hash(
             image_hash=image_hash,
             user_id=user_id,
             chat_id=message.chat.id,
@@ -4955,17 +5066,13 @@ def process_ocr_task(message, temp_path, image_hash=None):
             except: pass
             markup = get_menu_markup(user_id)
             notice = build_duplicate_receipt_notice(
-                first_seen_at,
-                first_sender_name,
+                user_name,
                 receipt_kind=first_receipt_kind,
-                confirmation_letters=first_confirmation
+                cached_display_fields=cached_display_fields
             )
-            if is_admin_user(user_id):
-                notice += "\n#问题"
             bot.reply_to(
                 message,
                 notice,
-                parse_mode="Markdown",
                 reply_markup=markup
             )
             return
@@ -5026,6 +5133,7 @@ def process_ocr_task(message, temp_path, image_hash=None):
             keep_receipt_hash = True
             bot.reply_to(message, build_stale_receipt_message(payment_info))
             return
+        set_receipt_image_display_fields(image_hash, payment_info=payment_info)
         
         # 🟢 UX IMPROVEMENT: Single Message Logic
         # We DO NOT send "Datos Leídos" anymore (too noisy)
@@ -5037,12 +5145,18 @@ def process_ocr_task(message, temp_path, image_hash=None):
         if isinstance(match, tuple) and match[0] == "ALREADY_VERIFIED":
             keep_receipt_hash = True
             verified_payment = match[1]
+            set_receipt_image_display_fields(
+                image_hash,
+                payment_info=payment_info,
+                account_tag=verified_payment[7] if len(verified_payment) > 7 else None
+            )
             
             # Get Menu Markup
             markup = get_menu_markup(user_id)
 
             ya_procesado_msg = build_compact_ocr_status_line(
                 status_icon="🟡",
+                description_line="Comprobante ya procesado",
                 payment_time=verified_payment[2] if len(verified_payment) > 2 else payment_info.get('time'),
                 amount=verified_payment[3] if len(verified_payment) > 3 else payment_info.get('amount'),
                 payment_sender_name=verified_payment[4] if len(verified_payment) > 4 else payment_info.get('sender_name'),
@@ -5075,6 +5189,7 @@ def process_ocr_task(message, temp_path, image_hash=None):
             # Pending Message
             blue_text = build_compact_ocr_status_line(
                 status_icon="🔵",
+                description_line="Verificando pago...",
                 payment_time=payment_info.get('time'),
                 amount=payment_info.get('amount'),
                 payment_sender_name=payment_info.get('sender_name'),
@@ -5103,6 +5218,7 @@ def process_ocr_task(message, temp_path, image_hash=None):
         db_amount = match[3]
         db_sender = match[4]
         account_tag = match[7]
+        set_receipt_image_display_fields(image_hash, payment_info=payment_info, account_tag=account_tag)
         
         # Mark as verified
         if not mark_payment_verified(payment_id, user_id=user_id):
@@ -5168,7 +5284,7 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
             sender_name = "Canal"
 
         # Duplicate image check
-        is_duplicate_image, first_seen_at, hash_reserved, first_sender_name, first_receipt_kind, first_confirmation = register_receipt_image_hash(
+        is_duplicate_image, first_seen_at, hash_reserved, first_sender_name, first_receipt_kind, first_confirmation, cached_display_fields = register_receipt_image_hash(
             image_hash=image_hash,
             user_id=sender_user_id,
             chat_id=message.chat.id,
@@ -5179,15 +5295,13 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
             try: os.remove(temp_path)
             except: pass
             notice = build_duplicate_receipt_notice(
-                first_seen_at,
-                first_sender_name,
+                sender_name,
                 receipt_kind=first_receipt_kind,
-                confirmation_letters=first_confirmation
-            ) + "\n#问题"
+                cached_display_fields=cached_display_fields
+            )
             bot.reply_to(
                 message,
-                notice,
-                parse_mode="Markdown"
+                notice
             )
             return
 
@@ -5243,6 +5357,7 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
             keep_receipt_hash = True
             bot.reply_to(message, build_stale_receipt_message(payment_info))
             return
+        set_receipt_image_display_fields(image_hash, payment_info=payment_info)
 
         # Search for payment
         match = search_yappy_payment(payment_info)
@@ -5251,10 +5366,16 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
         if isinstance(match, tuple) and match[0] == "ALREADY_VERIFIED":
             keep_receipt_hash = True
             verified_payment = match[1]
+            set_receipt_image_display_fields(
+                image_hash,
+                payment_info=payment_info,
+                account_tag=verified_payment[7] if len(verified_payment) > 7 else None
+            )
             bot.reply_to(
                 message,
                 build_compact_ocr_status_line(
                     status_icon="🟡",
+                    description_line="Comprobante ya procesado",
                     payment_time=verified_payment[2] if len(verified_payment) > 2 else payment_info.get('time'),
                     amount=verified_payment[3] if len(verified_payment) > 3 else payment_info.get('amount'),
                     payment_sender_name=verified_payment[4] if len(verified_payment) > 4 else payment_info.get('sender_name'),
@@ -5274,6 +5395,7 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
                 message,
                 build_compact_ocr_status_line(
                     status_icon="🔵",
+                    description_line="Verificando pago...",
                     payment_time=payment_info.get('time'),
                     amount=payment_info.get('amount'),
                     payment_sender_name=payment_info.get('sender_name'),
@@ -5317,6 +5439,7 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
         db_amount = match[3]
         db_sender = match[4]
         account_tag = match[7]
+        set_receipt_image_display_fields(image_hash, payment_info=payment_info, account_tag=account_tag)
 
         if not mark_payment_verified(payment_id, user_id=sender_user_id or None):
             bot.reply_to(message, "❌ No pude finalizar la verificación del pago.")
