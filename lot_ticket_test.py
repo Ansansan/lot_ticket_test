@@ -2919,14 +2919,18 @@ def check_and_notify_pending(payment_data, payment_id):
                         print(f"⚠️ Failed to edit blue reply {reply_message_id} in {chat_id}: {e}")
 
                 if not edited_existing_followup:
+                    # Keep the green confirmation inside the issues topic when the
+                    # pending row lives there (not the channel-fallback case).
+                    thread_id = (RECEIPT_ISSUES_TOPIC_ID
+                                 if str(chat_id) == str(RECEIPT_ISSUES_GROUP_ID) else None)
                     if message_id:
                         try:
-                            sent_msg = bot.send_message(chat_id, msg, reply_to_message_id=message_id)
+                            sent_msg = bot.send_message(chat_id, msg, reply_to_message_id=message_id, message_thread_id=thread_id)
                         except Exception as e:
                             print(f"⚠️ Reply-to send failed for pending verification {req_id}: {e}")
-                            sent_msg = bot.send_message(chat_id, msg)
+                            sent_msg = bot.send_message(chat_id, msg, message_thread_id=thread_id)
                     else:
-                        sent_msg = bot.send_message(chat_id, msg)
+                        sent_msg = bot.send_message(chat_id, msg, message_thread_id=thread_id)
 
                     mirror_to_topic(chat_id, sent_msg)
                     if followup_id:
@@ -4741,8 +4745,11 @@ def yappy_test_insert(message):
 # admin-topic handler below (gated on is_admin_chat == ADMIN_GROUP_ID) never fires
 # there, so a 5-letter confirmation correction in the issues topic would be missed.
 # This dedicated handler covers that case; the equal-group case is handled inline
-# in reply_to_user_topic. The filters are mutually exclusive (group != vs ==), so a
-# correction is never processed twice.
+# in reply_to_user_topic. For a chat-based reply the filters are disjoint (group !=
+# vs chat == ADMIN_GROUP_ID); the one overlap is a super-admin USER replying in a
+# decoupled group (is_admin_chat is also true for from_user == ADMIN_USER_ID), and
+# that is resolved safely by registration order — this handler is registered first,
+# and telebot dispatches an update to the first matching handler only.
 @bot.message_handler(
     func=lambda m: bool(
         RECEIPT_ISSUES_GROUP_ID
@@ -5362,14 +5369,21 @@ def process_ocr_task(message, temp_path, image_hash=None):
 
 def _telegram_send_with_retry(send_fn, max_retries=5):
     """Run a Telegram send callable, retrying on a 429 'retry after N' flood wait
-    and transient API errors with the same backoff as copy_message_with_retry."""
+    and transient (5xx / network) errors, with the same backoff as
+    copy_message_with_retry. Permanent client errors (a 400 that is not a flood —
+    e.g. a bad caption or a Markdown parse error) are NOT retried: they fail fast
+    so the caller can fall back instead of burning the whole backoff budget (and
+    so a once-succeeded send is never blindly re-posted)."""
     delay = 0.5
     for attempt in range(max_retries):
         try:
             return send_fn()
         except Exception as e:
-            if attempt < max_retries - 1:
-                m = re.search(r'retry after\s+(\d+)', str(e), re.IGNORECASE)
+            m = re.search(r'retry after\s+(\d+)', str(e), re.IGNORECASE)
+            code = getattr(e, 'error_code', None)
+            # Retry floods, 5xx, and non-API (network) errors; never a plain 400.
+            retryable = bool(m) or code is None or code >= 500
+            if retryable and attempt < max_retries - 1:
                 if m:
                     wait_s = int(m.group(1)) + 0.2
                 else:
@@ -5400,26 +5414,39 @@ def relocate_receipt_issue_to_topic(message, status_text, parse_mode=None):
             return None
 
     photo_variants = getattr(message, 'photo', None) or []
-    try:
+
+    def _send(pm):
         if photo_variants:
-            sent = _telegram_send_with_retry(lambda: bot.send_photo(
+            return bot.send_photo(
                 RECEIPT_ISSUES_GROUP_ID,
                 photo=photo_variants[-1].file_id,
                 caption=status_text,
-                parse_mode=parse_mode,
+                parse_mode=pm,
                 message_thread_id=RECEIPT_ISSUES_TOPIC_ID
-            ))
-        else:
-            sent = _telegram_send_with_retry(lambda: bot.send_message(
-                RECEIPT_ISSUES_GROUP_ID,
-                status_text,
-                parse_mode=parse_mode,
-                message_thread_id=RECEIPT_ISSUES_TOPIC_ID
-            ))
+            )
+        return bot.send_message(
+            RECEIPT_ISSUES_GROUP_ID,
+            status_text,
+            parse_mode=pm,
+            message_thread_id=RECEIPT_ISSUES_TOPIC_ID
+        )
+
+    try:
+        try:
+            sent = _telegram_send_with_retry(lambda: _send(parse_mode))
+        except Exception as e:
+            # A Markdown parse error must not bounce the receipt out of the topic —
+            # retry the same topic send as plain text and stay in the topic.
+            if parse_mode and _looks_like_markdown_send_error(e):
+                sent = _telegram_send_with_retry(lambda: _send(None))
+            else:
+                raise
     except Exception as e:
         print(f"⚠️ Failed to send receipt issue to topic: {e}")
         try:
-            return bot.reply_to(message, status_text, parse_mode=parse_mode)
+            # Plain text on the channel fallback so a Markdown/parse error can't
+            # re-fail here and drop the result entirely.
+            return bot.reply_to(message, status_text)
         except Exception as e2:
             print(f"⚠️ Channel reply fallback also failed: {e2}")
             return None

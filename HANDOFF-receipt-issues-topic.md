@@ -177,3 +177,30 @@ Fail-safe delete-after-send ordering; pending-row points at the topic message so
 blue→green can't target a deleted original; echo loop cannot occur; green path & DM flow
 untouched; `apply_confirmation_correction` refactor is behavior-preserving; `file_id`
 cross-chat reuse is valid; money-request branch has no double-send.
+
+## 11. Second cold-review pass (4 independent fresh-context agents, post-fix)
+Run against the committed branch (`a40ee22` receipt + `97a3735` hardening + `baedd7e`
+premios). Verdicts: cold auditor **ship-able / no blockers**; correctness **APPROVE**;
+telebot/API **approve with changes**; premios security **APPROVE** (all premios write/
+report paths gated, lockout fallback sound, chunking content-preserving and does not alter
+payout math). New edge findings — now fixed in `a` (this pass):
+
+- **A. ✅ Markdown caption could drop the relocation.** On a Markdown parse error the topic
+  send failed and the channel fallback re-passed `parse_mode`, re-failing. Now: a parse
+  error retries the topic send as plain text (stays in topic); the channel fallback is
+  plain text. (`relocate_receipt_issue_to_topic`, reuses `_looks_like_markdown_send_error`.)
+- **B. ✅ Retry helper no longer retries permanent 400s.** `_telegram_send_with_retry` now
+  retries only floods / 5xx / network errors, failing fast on a plain 400 (less wasted
+  backoff; avoids re-posting a once-succeeded send).
+- **C. ✅ Green fallback stays in the topic.** The rare `check_and_notify_pending`
+  edit-failure fallback now passes `message_thread_id` so the green confirmation doesn't
+  land in the group's General thread.
+- **D. ⬜ ACCEPTED — photo caption 1024-char ceiling.** Relocated statuses are captions
+  (1024) vs the old text replies (4096). All current status strings are far under; on the
+  unlikely overflow the send fails and self-heals to a channel text reply. Not guarding
+  with truncation (over-engineering for the actual string lengths).
+- **E. ⬜ ACCEPTED/LATENT — corrections inert if `RECEIPT_ISSUES_TOPIC_ID` is unset.** The
+  bare code default is `None`; live `.env` sets `47362`. Blue→green auto-edit still works;
+  only manual 5-letter correction is inert when no topic is configured.
+- **F. ✅ Comment corrected** re: the two correction handlers being resolved by registration
+  order in the super-admin-user edge (not purely disjoint filters).
