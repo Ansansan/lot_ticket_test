@@ -123,6 +123,12 @@ else:
 TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_GROUP_ID = int(os.getenv('ADMIN_GROUP_ID', -1003595738966))
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 8550582981))
+_premios_admins_raw = os.getenv('ADMIN_USER_IDS', '')
+ADMIN_USER_IDS = {int(x.strip()) for x in _premios_admins_raw.split(',') if x.strip().isdigit()}
+# Safety net: the legacy super-admin is always allowed, so an empty or unset
+# ADMIN_USER_IDS can never lock everyone out of the premios/results workflow.
+if ADMIN_USER_ID:
+    ADMIN_USER_IDS = ADMIN_USER_IDS | {ADMIN_USER_ID}
 HISTORY_API_BASE = os.getenv('HISTORY_API_BASE', 'https://tel.pythonanywhere.com/')
 
 # 🔐 CLAVE SECRETA (SALT)
@@ -185,6 +191,14 @@ def is_admin_user(user_id):
     """Check if a user is an admin (present in ADMIN_RECEIPT_EMOJIS).
     Admin users don't need to pay for tickets and their tickets are never invalidated."""
     return int(user_id) in ADMIN_RECEIPT_EMOJIS
+
+
+def can_manage_premios(user_id):
+    """Premios workflow authorization backed only by ADMIN_USER_IDS."""
+    try:
+        return int(user_id) in ADMIN_USER_IDS
+    except Exception:
+        return False
 
 
 def should_mirror_user(user_id):
@@ -6025,8 +6039,8 @@ def handle_lista_command(message):
 
 @bot.message_handler(commands=['premios'])
 def set_results_ui(message):
-    if not is_admin_chat(message): 
-        bot.reply_to(message, "⛔ Solo Grupo Admin.")
+    if not can_manage_premios(message.from_user.id):
+        bot.reply_to(message, "⛔ No tienes permisos para introducir premios.")
         return
     
     bot_username = bot.get_me().username
@@ -6047,8 +6061,8 @@ def send_welcome(message):
 
         # 🟢 ADMIN MENU
         if len(args) > 1 and args[1] == 'admin_menu':
-            if not is_admin_chat(message):
-                bot.reply_to(message, "⛔ No tienes permisos de administrador.")
+            if not can_manage_premios(message.from_user.id):
+                bot.reply_to(message, "⛔ No tienes permisos para introducir premios.")
                 return
 
             web_app_url = f"{WEBAPP_BASE_URL}index.html?v={BOT_VERSION}&mode=admin_dashboard&nacional_dates={dates_str}&uid={user_id}"
@@ -6113,8 +6127,9 @@ def handle_web_app(message):
         action = payload.get('action') 
 
         if action == 'save_results':
-            if str(message.from_user.id) != str(ADMIN_USER_ID) and str(message.chat.id) != str(ADMIN_GROUP_ID):
-                 return
+            if not can_manage_premios(message.from_user.id):
+                bot.reply_to(message, "⛔ No tienes permisos para introducir premios.")
+                return
 
             db_path = os.path.join(BASE_DIR, 'tickets_test.db')
             conn = sqlite3.connect(db_path)
@@ -7084,6 +7099,87 @@ def _escape_md(text):
         text = text.replace(ch, '\\' + ch)
     return text
 
+PREMIOS_REPORT_SAFE_LIMIT = 3500
+
+
+def _looks_like_markdown_send_error(exc):
+    message = str(exc or "").lower()
+    if "message is too long" in message:
+        return False
+    markdown_hints = (
+        "parse entities",
+        "can't parse entities",
+        "can't find end of",
+        "can't find end",
+        "markdown",
+        "entity",
+        "reserved character"
+    )
+    return any(token in message for token in markdown_hints)
+
+
+def _send_premios_report_chunk(chat_id, text):
+    try:
+        bot.send_message(chat_id, text, parse_mode="Markdown")
+    except Exception as e:
+        if _looks_like_markdown_send_error(e):
+            bot.send_message(chat_id, text)
+            return
+        raise
+
+
+def _append_report_section(chunks, current_chunk, section_text, limit=PREMIOS_REPORT_SAFE_LIMIT):
+    if not section_text:
+        return current_chunk
+    candidate = section_text if not current_chunk else f"{current_chunk}\n\n{section_text}"
+    if len(candidate) <= limit:
+        return candidate
+    if current_chunk:
+        chunks.append(current_chunk)
+    if len(section_text) > limit:
+        raise ValueError(f"Premios report section exceeds safe limit ({len(section_text)} > {limit})")
+    return section_text
+
+
+def _build_ticket_report_sections(ticket_id, ticket_total_win, ticket_breakdown_lines, limit=PREMIOS_REPORT_SAFE_LIMIT):
+    base_header = f"🎫 **Ticket #{ticket_id}** | 中奖金额: **${ticket_total_win:.2f}**"
+    all_lines = [base_header] + list(ticket_breakdown_lines)
+    max_len = max(len(re.sub(r'[*\\\[\]]', '', line)) for line in all_lines)
+    dash_sep = "─" * max_len
+    full_block = f"{base_header}\n" + "\n".join(ticket_breakdown_lines) + f"\n{dash_sep}"
+    if len(full_block) <= limit:
+        return [full_block]
+
+    sections = []
+    remaining_lines = list(ticket_breakdown_lines)
+    part_index = 1
+
+    while remaining_lines:
+        header = base_header if part_index == 1 else f"{base_header} (continuación {part_index})"
+        segment_lines = []
+        segment_text = None
+
+        while remaining_lines:
+            candidate_lines = segment_lines + [remaining_lines[0]]
+            is_final_segment = len(remaining_lines) == 1
+            candidate_text = f"{header}\n" + "\n".join(candidate_lines)
+            if is_final_segment:
+                candidate_text += f"\n{dash_sep}"
+            if len(candidate_text) <= limit:
+                segment_lines.append(remaining_lines.pop(0))
+                segment_text = candidate_text
+            else:
+                break
+
+        if not segment_lines:
+            raise ValueError(f"Premios ticket block line exceeds safe limit for ticket #{ticket_id}")
+
+        sections.append(segment_text if segment_text else f"{header}\n" + "\n".join(segment_lines))
+        part_index += 1
+
+    return sections
+
+
 def calculate_and_report(chat_id, date, lottery_name, w1, w2, w3):
     db_path = os.path.join(BASE_DIR, 'tickets_test.db')
     conn = sqlite3.connect(db_path)
@@ -7094,9 +7190,10 @@ def calculate_and_report(chat_id, date, lottery_name, w1, w2, w3):
     if not tickets:
         bot.send_message(chat_id, f"🔍 {date} 的 {lottery_name} 没有售出任何票。")
         return
-    report = f"💰 **详细报表**\nSorteo: {_escape_md(lottery_name)}\n日期: {date}\n🏆: {w1}-{w2}-{w3}\n====================\n"
+    header_section = f"💰 **详细报表**\nSorteo: {_escape_md(lottery_name)}\n日期: {date}\n🏆: {w1}-{w2}-{w3}\n===================="
     total_payout = 0
     winners_count = 0
+    ticket_section_groups = []
     for ticket in tickets:
         t_id, data_json = ticket
         items = json.loads(data_json)
@@ -7114,21 +7211,52 @@ def calculate_and_report(chat_id, date, lottery_name, w1, w2, w3):
         if ticket_total_win > 0:
             winners_count += 1
             total_payout += ticket_total_win
-            header = f"🎫 **Ticket #{t_id}** | 中奖金额: **${ticket_total_win:.2f}**"
-            # Compute dash separator length from the longest visible line in this ticket block
-            all_lines = [header] + ticket_breakdown_lines
-            max_len = max(len(re.sub(r'[*\\\[\]]', '', l)) for l in all_lines)
-            dash_sep = "─" * max_len
-            report += f"\n{header}\n"
-            report += "\n".join(ticket_breakdown_lines) + "\n"
-            report += f"{dash_sep}\n"
-    report += "\n====================\n"
-    report += f"👥 中奖票数: {winners_count}\n"
-    report += f"💸 **总中奖金额: ${total_payout:.2f}**"
-    try:
-        bot.send_message(chat_id, report, parse_mode="Markdown")
-    except Exception:
-        bot.send_message(chat_id, report)
+            ticket_section_groups.append(
+                _build_ticket_report_sections(t_id, ticket_total_win, ticket_breakdown_lines)
+            )
+
+    footer_section = (
+        "====================\n"
+        f"👥 中奖票数: {winners_count}\n"
+        f"💸 **总中奖金额: ${total_payout:.2f}**"
+    )
+
+    chunks = []
+    current_chunk = header_section
+    for section_group in ticket_section_groups:
+        if len(section_group) == 1:
+            current_chunk = _append_report_section(chunks, current_chunk, section_group[0])
+            continue
+
+        first_section = section_group[0]
+        if current_chunk == header_section:
+            combined = f"{current_chunk}\n\n{first_section}"
+            if len(combined) <= PREMIOS_REPORT_SAFE_LIMIT:
+                chunks.append(combined)
+                current_chunk = ""
+                chunks.extend(section_group[1:])
+                continue
+
+        if current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = ""
+        chunks.extend(section_group)
+
+    if current_chunk:
+        current_chunk = _append_report_section(chunks, current_chunk, footer_section)
+        if current_chunk:
+            chunks.append(current_chunk)
+    elif chunks:
+        footer_candidate = f"{chunks[-1]}\n\n{footer_section}"
+        if len(footer_candidate) <= PREMIOS_REPORT_SAFE_LIMIT:
+            chunks[-1] = footer_candidate
+        else:
+            chunks.append(footer_section)
+    else:
+        chunks.append(footer_section)
+
+    for chunk_text in chunks:
+        _send_premios_report_chunk(chat_id, chunk_text)
 
 # --- TOPIC MANAGEMENT ---
 def init_support_db():
