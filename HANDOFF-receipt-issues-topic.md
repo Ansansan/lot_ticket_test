@@ -1,7 +1,9 @@
 # Cold-review handoff — relocate non-green channel receipts to an admin topic
 
 > For a reviewer with **no prior context**. Everything needed to judge correctness
-> independently is below. The change is **uncommitted** in the working tree.
+> independently is below. The work is now **two separate commits** on branch
+> `2026-06-25-receipt-issues-topic` (off `main`, not pushed) — review each commit on
+> its own (see §0). Cold-review findings from the first pass are in §10.
 
 ## 0. Where you are (read first)
 - This repo is **`lot ticket bot test`** (`lot_ticket_test.py`) — the **Yappy
@@ -9,14 +11,18 @@
   `lot ticket bot` (the lottery bot, which has no receipt OCR). Do not look there.
 - Source file changed: **`lot_ticket_test.py`**. Runtime config changed: **`.env`**
   (gitignored — not in `git diff`).
-- ⚠️ **The working-tree diff is NOT only the receipt change.** When this work began,
-  `lot_ticket_test.py` already had **pre-existing uncommitted changes** unrelated to
-  receipts — a **premios authorization rewrite** (`ADMIN_USER_IDS`,
-  `can_manage_premios`, gates on `/premios` / `admin_menu` / `save_results`) and
-  **premios report chunking** (`_send_premios_report_chunk`). Those are **not part of
-  this feature** and should be split into their own commit/PR. See §10 finding 1.
-- See the diff: `git diff -- lot_ticket_test.py`. The **receipt-relocation** change is
-  the subset described in §4; everything premios-related is the pre-existing bundle.
+- ⚠️ **Two separate concerns, now in two commits — review them independently:**
+  - `a40ee22` **Relocate non-green channel receipts** — THE feature this handoff
+    describes (§1–§9). Review against the requirement. `git show a40ee22`.
+  - `baedd7e` **premios: allowlist authorization + chunked prize reports** — a
+    *pre-existing* change (`ADMIN_USER_IDS`, `can_manage_premios`, `/premios` /
+    `admin_menu` / `save_results` gates, `_send_premios_report_chunk`) that was
+    already uncommitted in the file when this work began. **Not part of the receipt
+    feature** — out of scope for this handoff; judge it on its own. `git show baedd7e`.
+  - The split is verified clean: `a40ee22` contains zero premios tokens, `baedd7e`
+    zero receipt tokens, and the two together are byte-identical to the working file.
+- Review fixes from the first cold-review pass are folded into these commits, not a
+  third diff — see §10 for per-finding status (✅ fixed / ⬜ open / ❌ false positive).
 - Python syntax verified: `python -m py_compile lot_ticket_test.py` → OK.
 
 ## 1. Requirement (what was asked)
