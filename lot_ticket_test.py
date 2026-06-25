@@ -151,6 +151,10 @@ QWEN_MODEL = os.getenv('QWEN_MODEL', '').strip()
 
 YAPPY_PAYMENTS_GROUP_ID = int(os.getenv('YAPPY_PAYMENTS_GROUP_ID', 0)) if os.getenv('YAPPY_PAYMENTS_GROUP_ID') else None
 RECEIPT_FORWARD_CHANNEL_ID = int(os.getenv('RECEIPT_FORWARD_CHANNEL_ID', 0)) if os.getenv('RECEIPT_FORWARD_CHANNEL_ID') else None
+# Where non-green ("issue") receipts forwarded to the channel are relocated to.
+# Defaults to the admin group; RECEIPT_ISSUES_TOPIC_ID is the forum topic thread id.
+RECEIPT_ISSUES_GROUP_ID = int(os.getenv('RECEIPT_ISSUES_GROUP_ID')) if os.getenv('RECEIPT_ISSUES_GROUP_ID') else ADMIN_GROUP_ID
+RECEIPT_ISSUES_TOPIC_ID = int(os.getenv('RECEIPT_ISSUES_TOPIC_ID')) if os.getenv('RECEIPT_ISSUES_TOPIC_ID') else None
 YAPPY_DIRECT_INGEST_ENABLED = os.getenv('YAPPY_DIRECT_INGEST_ENABLED', '0').strip().lower() in ('1', 'true', 'yes', 'on')
 MONEY_REQUEST_WARNING_GROUP_ID = int(os.getenv('MONEY_REQUEST_WARNING_GROUP_ID', -1003795391458))
 WEBAPP_BASE_URL = os.getenv('WEBAPP_BASE_URL', 'https://ansansan.github.io/LotTicket/test/')
@@ -2780,6 +2784,26 @@ def add_pending_verification(user_id, chat_id, message_id, confirmation, amount,
         print(f"❌ Error adding pending: {e}")
         return None
 
+def edit_status_text_or_caption(chat_id, message_id, text, reply_markup=None):
+    """Edit a status message in place. The relocated issue-topic messages are
+    photos, so try the caption first. Only fall back to editing text when the
+    target genuinely has no caption (a plain-text message). Treat "not modified"
+    as a no-op, and let other errors propagate instead of masking a recoverable
+    failure behind a guaranteed second one."""
+    try:
+        return bot.edit_message_caption(
+            caption=text, chat_id=chat_id, message_id=message_id, reply_markup=reply_markup
+        )
+    except Exception as e:
+        desc = str(getattr(e, 'description', '') or e).lower()
+        if 'not modified' in desc:
+            return None  # already shows this content; nothing to do
+        if 'no caption' in desc:
+            # Target is a plain-text message (legacy) — edit its text instead.
+            return bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup)
+        raise
+
+
 def check_and_notify_pending(payment_data, payment_id):
     """
     Check if a new payment matches any pending verification requests.
@@ -2858,17 +2882,14 @@ def check_and_notify_pending(payment_data, payment_id):
                         mirror_receipt_followup_action_message(followup)
                         complete_receipt_followup(followup_id, status="PROCESSED", update_markup=False)
 
-                # Try editing the channel blue reply message directly
+                # Try editing the blue reply message directly. It now lives in the
+                # issues topic as a photo, so edit its caption (text fallback inside).
                 if not edited_existing_followup and reply_message_id and chat_id:
                     try:
-                        bot.edit_message_text(
-                            msg,
-                            chat_id,
-                            reply_message_id
-                        )
+                        edit_status_text_or_caption(chat_id, reply_message_id, msg)
                         edited_existing_followup = True
                     except Exception as e:
-                        print(f"⚠️ Failed to edit channel blue reply {reply_message_id} in {chat_id}: {e}")
+                        print(f"⚠️ Failed to edit blue reply {reply_message_id} in {chat_id}: {e}")
 
                 if not edited_existing_followup:
                     if message_id:
@@ -4698,7 +4719,24 @@ def reply_to_user_topic(message):
     """
     # Ignore commands or if it's the specific "General" topic (thread_id=None usually, but distinct in forums)
     if message.text and message.text.startswith('/'): return
-    
+
+    # Receipt-issues topic: an admin replying with a 5-letter code corrects a
+    # pending (blue) receipt's confirmation. Handle that before support mirroring.
+    # NOTE: this fires here because RECEIPT_ISSUES_GROUP_ID defaults to the admin
+    # group; if it is ever pointed at a different group, add a dedicated handler.
+    # Requires a configured topic id and an exact thread match — corrections are
+    # only meaningful inside the issues topic, never the group's General thread.
+    try:
+        if (message.text and message.reply_to_message
+                and RECEIPT_ISSUES_GROUP_ID
+                and str(message.chat.id) == str(RECEIPT_ISSUES_GROUP_ID)
+                and RECEIPT_ISSUES_TOPIC_ID is not None
+                and message.message_thread_id == RECEIPT_ISSUES_TOPIC_ID):
+            if apply_confirmation_correction(message):
+                return
+    except Exception as e:
+        print(f"⚠️ Issue-topic correction check failed: {e}")
+
     try:
         thread_id = message.message_thread_id
         
@@ -4824,6 +4862,136 @@ def handle_photo_verification(message):
     except Exception as e:
         print(f"❌ Error queuing photo: {e}")
 
+def apply_confirmation_correction(message):
+    """Apply a manual 5-letter confirmation correction when an admin replies to a
+    pending ('blue') receipt message — in the issues topic or the forward channel.
+
+    Returns True if the reply targeted a pending verification (and was handled),
+    False otherwise (so a caller can continue with its normal handling).
+    """
+    if not (message.text and message.reply_to_message):
+        return False
+
+    confirmation, confirmation_full = normalize_manual_confirmation(message.text)
+    if not confirmation:
+        return False  # Not a valid confirmation code
+
+    replied_msg_id = message.reply_to_message.message_id
+    chat_id = message.chat.id
+
+    # Look up pending verification whose blue reply matches the replied-to message
+    conn = get_yappy_db()
+    c = conn.cursor()
+    c.execute('''SELECT id, user_id, chat_id, message_id, confirmation_letters, amount,
+                        receipt_time, followup_id, reply_message_id
+                 FROM pending_verifications
+                 WHERE reply_message_id = ? AND chat_id = ?''',
+              (replied_msg_id, chat_id))
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        return False  # Replied message is not a pending blue verification
+
+    pending_id, user_id, p_chat_id, orig_msg_id, old_confirmation, amount, receipt_time, followup_id, reply_msg_id = row
+    print(f"[CORRECTION] Pending {pending_id}: {old_confirmation} → {confirmation}")
+
+    # Update pending with corrected confirmation code
+    conn = get_yappy_db()
+    c = conn.cursor()
+    c.execute("UPDATE pending_verifications SET confirmation_letters = ? WHERE id = ?",
+              (confirmation, pending_id))
+    conn.commit()
+    conn.close()
+
+    # Try to match a payment with the corrected code
+    payment_info = {
+        'confirmation': confirmation,
+        'amount': amount,
+        'time': receipt_time,
+    }
+    match = search_yappy_payment(payment_info)
+
+    # The blue message is a photo with a caption (relocated to the topic), so read
+    # the original status from .caption, falling back to .text for legacy messages.
+    orig_text = (message.reply_to_message.caption or message.reply_to_message.text or "")
+    parsed_status = _parse_compact_ocr_status_text(orig_text)
+    receipt_sender_name = (
+        str(parsed_status.get('receipt_sender_token') or "").lstrip('#')
+        or parsed_status.get('receipt_sender_name')
+        or lookup_support_user_name(user_id)
+    )
+
+    if match and not (isinstance(match, tuple) and match[0] == "ALREADY_VERIFIED"):
+        # Payment found — verify it
+        payment_id = match[0]
+        db_time = match[2]
+        db_amount = match[3]
+        db_sender = match[4]
+        account_tag = match[7]
+
+        if not mark_payment_verified(payment_id, user_id=user_id or None):
+            bot.reply_to(message, "❌ No pude finalizar la verificación.")
+            return True
+
+        if user_id and not is_admin_user(user_id):
+            process_wallet_deposit(user_id, db_amount)
+
+        success_msg = build_compact_ocr_status_line(
+            status_icon="✅",
+            payment_time=db_time,
+            amount=db_amount,
+            payment_sender_name=db_sender,
+            account_tag=account_tag,
+            receipt_sender_name=receipt_sender_name,
+            confirmation=confirmation,
+            confirmation_full=confirmation_full
+        )
+
+        try:
+            edit_status_text_or_caption(chat_id, replied_msg_id, success_msg)
+        except Exception as e:
+            print(f"⚠️ Failed to edit blue message after correction: {e}")
+            bot.reply_to(message, success_msg)
+
+        # Remove from pending
+        conn = get_yappy_db()
+        c = conn.cursor()
+        c.execute("DELETE FROM pending_verifications WHERE id = ?", (pending_id,))
+        conn.commit()
+        conn.close()
+
+        if followup_id:
+            complete_receipt_followup(followup_id, status="PROCESSED")
+
+    else:
+        updated_msg = build_compact_ocr_status_line(
+            status_icon="🔵",
+            description_line="Verificando pago...",
+            payment_time=receipt_time,
+            amount=amount,
+            payment_sender_name=parsed_status.get('payment_sender_name') or "?",
+            account_tag=parsed_status.get('account_tag') or "?",
+            receipt_sender_name=receipt_sender_name,
+            confirmation=confirmation,
+            confirmation_full=confirmation_full,
+            include_issue_tag=True
+        )
+
+        try:
+            edit_status_text_or_caption(chat_id, replied_msg_id, updated_msg)
+        except Exception as e:
+            print(f"⚠️ Failed to edit blue message for correction: {e}")
+
+    # Delete the admin's correction reply to keep the topic/channel clean
+    try:
+        bot.delete_message(chat_id, message.message_id)
+    except Exception:
+        pass
+
+    return True
+
+
 # --- CHANNEL TEXT REPLY HANDLER (Correct confirmation code by replying to blue message) ---
 @bot.channel_post_handler(
     func=lambda message: bool(
@@ -4835,137 +5003,10 @@ def handle_photo_verification(message):
     content_types=['text']
 )
 def handle_channel_confirmation_correction(message):
-    """Allow correcting a confirmation code by replying to the blue verificando message with 5 letters."""
+    """Correct a confirmation code by replying to a blue message in the channel
+    (legacy path; blue messages now normally live in the issues topic)."""
     try:
-        confirmation, confirmation_full = normalize_manual_confirmation(message.text)
-        if not confirmation:
-            return  # Not a valid confirmation code, ignore silently
-
-        replied_msg_id = message.reply_to_message.message_id
-        chat_id = message.chat.id
-
-        # Look up pending verification whose blue reply matches the message being replied to
-        conn = get_yappy_db()
-        c = conn.cursor()
-        c.execute('''SELECT id, user_id, chat_id, message_id, confirmation_letters, amount,
-                            receipt_time, followup_id, reply_message_id
-                     FROM pending_verifications
-                     WHERE reply_message_id = ? AND chat_id = ?''',
-                  (replied_msg_id, chat_id))
-        row = c.fetchone()
-        conn.close()
-
-        if not row:
-            return  # Replied message is not a pending blue verification
-
-        pending_id, user_id, p_chat_id, orig_msg_id, old_confirmation, amount, receipt_time, followup_id, reply_msg_id = row
-        print(f"[CHANNEL CORRECTION] Pending {pending_id}: {old_confirmation} → {confirmation}")
-
-        # Update pending with corrected confirmation code
-        conn = get_yappy_db()
-        c = conn.cursor()
-        c.execute("UPDATE pending_verifications SET confirmation_letters = ? WHERE id = ?",
-                  (confirmation, pending_id))
-        conn.commit()
-        conn.close()
-
-        # Try to match a payment with the corrected code
-        payment_info = {
-            'confirmation': confirmation,
-            'amount': amount,
-            'time': receipt_time,
-        }
-        match = search_yappy_payment(payment_info)
-
-        if match and not (isinstance(match, tuple) and match[0] == "ALREADY_VERIFIED"):
-            # Payment found — verify it
-            payment_id = match[0]
-            db_time = match[2]
-            db_amount = match[3]
-            db_sender = match[4]
-            account_tag = match[7]
-
-            if not mark_payment_verified(payment_id, user_id=user_id or None):
-                bot.reply_to(message, "❌ No pude finalizar la verificación.")
-                return
-
-            if user_id and not is_admin_user(user_id):
-                process_wallet_deposit(user_id, db_amount)
-            orig_text = (message.reply_to_message.text or "") if message.reply_to_message else ""
-            parsed_status = _parse_compact_ocr_status_text(orig_text)
-            receipt_sender_name = (
-                str(parsed_status.get('receipt_sender_token') or "").lstrip('#')
-                or parsed_status.get('receipt_sender_name')
-                or lookup_support_user_name(user_id)
-            )
-
-            success_msg = build_compact_ocr_status_line(
-                status_icon="✅",
-                payment_time=db_time,
-                amount=db_amount,
-                payment_sender_name=db_sender,
-                account_tag=account_tag,
-                receipt_sender_name=receipt_sender_name,
-                confirmation=confirmation,
-                confirmation_full=confirmation_full
-            )
-
-            try:
-                bot.edit_message_text(
-                    success_msg,
-                    chat_id,
-                    replied_msg_id
-                )
-            except Exception as e:
-                print(f"⚠️ Failed to edit blue message after correction: {e}")
-                bot.reply_to(message, success_msg)
-
-            # Remove from pending
-            conn = get_yappy_db()
-            c = conn.cursor()
-            c.execute("DELETE FROM pending_verifications WHERE id = ?", (pending_id,))
-            conn.commit()
-            conn.close()
-
-            if followup_id:
-                complete_receipt_followup(followup_id, status="PROCESSED")
-
-        else:
-            orig_text = (message.reply_to_message.text or "") if message.reply_to_message else ""
-            parsed_status = _parse_compact_ocr_status_text(orig_text)
-            receipt_sender_name = (
-                str(parsed_status.get('receipt_sender_token') or "").lstrip('#')
-                or parsed_status.get('receipt_sender_name')
-                or lookup_support_user_name(user_id)
-            )
-            updated_msg = build_compact_ocr_status_line(
-                status_icon="🔵",
-                description_line="Verificando pago...",
-                payment_time=receipt_time,
-                amount=amount,
-                payment_sender_name=parsed_status.get('payment_sender_name') or "?",
-                account_tag=parsed_status.get('account_tag') or "?",
-                receipt_sender_name=receipt_sender_name,
-                confirmation=confirmation,
-                confirmation_full=confirmation_full,
-                include_issue_tag=True
-            )
-
-            try:
-                bot.edit_message_text(
-                    updated_msg,
-                    chat_id,
-                    replied_msg_id
-                )
-            except Exception as e:
-                print(f"⚠️ Failed to edit blue message for correction: {e}")
-
-        # Delete the admin's correction reply to keep channel clean
-        try:
-            bot.delete_message(chat_id, message.message_id)
-        except Exception:
-            pass
-
+        apply_confirmation_correction(message)
     except Exception as e:
         print(f"❌ Channel confirmation correction error: {e}")
 
@@ -4992,7 +5033,9 @@ def handle_channel_photo(message):
             except Exception as e:
                 if attempt == 2:
                     print(f"❌ Channel photo download failed after retries: {e}")
-                    bot.reply_to(message, "Error descargando imagen.")
+                    # Non-green error edge: relocate to the issues topic (the image
+                    # can still be re-sent by file_id) instead of replying in-channel.
+                    relocate_receipt_issue_to_topic(message, "❌ Error descargando imagen.")
                     return
                 time.sleep(1)
 
@@ -5263,6 +5306,59 @@ def process_ocr_task(message, temp_path, image_hash=None):
             pass
 
 
+def relocate_receipt_issue_to_topic(message, status_text, parse_mode=None):
+    """
+    Relocate a non-green ("issue") channel receipt to the receipt-issues topic.
+
+    Sends the receipt image + status caption to RECEIPT_ISSUES_GROUP_ID / topic
+    RECEIPT_ISSUES_TOPIC_ID, then deletes the original forwarded post from the
+    channel. Returns the new topic message (or None).
+
+    Fail-safe: if the issues group is unconfigured, or the topic send fails, it
+    falls back to a normal channel reply and does NOT delete the original, so a
+    result is never silently dropped.
+    """
+    if not RECEIPT_ISSUES_GROUP_ID:
+        try:
+            return bot.reply_to(message, status_text, parse_mode=parse_mode)
+        except Exception as e:
+            print(f"⚠️ Channel reply failed (issues group unset): {e}")
+            return None
+
+    photo_variants = getattr(message, 'photo', None) or []
+    try:
+        if photo_variants:
+            sent = bot.send_photo(
+                RECEIPT_ISSUES_GROUP_ID,
+                photo=photo_variants[-1].file_id,
+                caption=status_text,
+                parse_mode=parse_mode,
+                message_thread_id=RECEIPT_ISSUES_TOPIC_ID
+            )
+        else:
+            sent = bot.send_message(
+                RECEIPT_ISSUES_GROUP_ID,
+                status_text,
+                parse_mode=parse_mode,
+                message_thread_id=RECEIPT_ISSUES_TOPIC_ID
+            )
+    except Exception as e:
+        print(f"⚠️ Failed to send receipt issue to topic: {e}")
+        try:
+            return bot.reply_to(message, status_text, parse_mode=parse_mode)
+        except Exception as e2:
+            print(f"⚠️ Channel reply fallback also failed: {e2}")
+            return None
+
+    # Topic copy succeeded -> remove the original forwarded receipt from the channel.
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception as e:
+        print(f"⚠️ Failed to delete original channel receipt {message.message_id}: {e}")
+
+    return sent
+
+
 def process_channel_ocr_task(message, temp_path, image_hash=None):
     """OCR processing for receipt images forwarded to the channel by another bot."""
     hash_reserved = False
@@ -5299,10 +5395,7 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
                 receipt_kind=first_receipt_kind,
                 cached_display_fields=cached_display_fields
             )
-            bot.reply_to(
-                message,
-                notice
-            )
+            relocate_receipt_issue_to_topic(message, notice)
             return
 
         ocr_selection = run_receipt_ocr(temp_path)
@@ -5312,7 +5405,7 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
 
         if not ocr_selection.get('success'):
             error_msg = ocr_selection.get('error', 'Unknown error')
-            bot.reply_to(message, f"❌ No pude leer la imagen (Error: {error_msg}).")
+            relocate_receipt_issue_to_topic(message, f"❌ No pude leer la imagen (Error: {error_msg}).")
             return
 
         ocr_text = ocr_selection['text']
@@ -5327,12 +5420,11 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
             keep_receipt_hash = True
             set_receipt_image_kind(image_hash, "MONEY_REQUEST")
             warning_msg = build_money_request_warning(payment_info, sender_name=sender_name)
+            send_money_request_alert(message, warning_msg)
             if sender_user_id and is_admin_user(sender_user_id):
-                send_money_request_alert(message, warning_msg)
-                bot.reply_to(message, warning_msg)
+                relocate_receipt_issue_to_topic(message, warning_msg, parse_mode="Markdown")
             else:
-                send_money_request_alert(message, warning_msg)
-                bot.reply_to(message, "Está pidiendo un yappy, y no enviando un yappy.")
+                relocate_receipt_issue_to_topic(message, "Está pidiendo un yappy, y no enviando un yappy.")
             return
 
         if not has_required_receipt_fields(payment_info):
@@ -5341,7 +5433,7 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
                 confirmation_full=payment_info.get('confirmation_full')
             )
             amount_text = f"${payment_info['amount']:.2f}" if payment_info.get('amount') else "?"
-            bot.reply_to(
+            relocate_receipt_issue_to_topic(
                 message,
                 f"⚠️ **Información incompleta**\n"
                 f"Monto: {amount_text}\n"
@@ -5355,7 +5447,7 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
 
         if not is_receipt_from_today_panama(payment_info):
             keep_receipt_hash = True
-            bot.reply_to(message, build_stale_receipt_message(payment_info))
+            relocate_receipt_issue_to_topic(message, build_stale_receipt_message(payment_info))
             return
         set_receipt_image_display_fields(image_hash, payment_info=payment_info)
 
@@ -5371,7 +5463,7 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
                 payment_info=payment_info,
                 account_tag=verified_payment[7] if len(verified_payment) > 7 else None
             )
-            bot.reply_to(
+            relocate_receipt_issue_to_topic(
                 message,
                 build_compact_ocr_status_line(
                     status_icon="🟡",
@@ -5390,8 +5482,9 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
 
         # Not found — add to pending so it auto-matches when the payment arrives
         if not match:
-            # Send blue reply FIRST so we can capture its message_id for later editing
-            blue_reply = bot.reply_to(
+            # Relocate the blue (image + status) to the issues topic FIRST so we can
+            # capture its message_id for later editing (and so the channel is cleaned).
+            blue_reply = relocate_receipt_issue_to_topic(
                 message,
                 build_compact_ocr_status_line(
                     status_icon="🔵",
@@ -5407,10 +5500,13 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
                 )
             )
             blue_reply_id = blue_reply.message_id if blue_reply else None
+            # Store WHERE the blue message now lives (issues topic, or channel on
+            # fallback) so check_and_notify_pending edits the right message later.
+            blue_chat_id = blue_reply.chat.id if blue_reply else message.chat.id
             pending_id = add_pending_verification(
                 sender_user_id,
-                message.chat.id,
-                message.message_id,
+                blue_chat_id,
+                blue_reply_id or message.message_id,
                 payment_info['confirmation'],
                 payment_info['amount'],
                 payment_info.get('time'),
@@ -5419,14 +5515,13 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
             if not pending_id:
                 if blue_reply_id:
                     try:
-                        bot.edit_message_text(
-                            "❌ No pude guardar la verificación pendiente.",
-                            message.chat.id,
-                            blue_reply_id
+                        edit_status_text_or_caption(
+                            blue_chat_id,
+                            blue_reply_id,
+                            "❌ No pude guardar la verificación pendiente."
                         )
                     except Exception as e:
                         print(f"⚠️ Failed to replace blue reply after pending save error: {e}")
-                        bot.reply_to(message, "❌ No pude guardar la verificación pendiente.")
                 else:
                     bot.reply_to(message, "❌ No pude guardar la verificación pendiente.")
                 return
@@ -5442,7 +5537,8 @@ def process_channel_ocr_task(message, temp_path, image_hash=None):
         set_receipt_image_display_fields(image_hash, payment_info=payment_info, account_tag=account_tag)
 
         if not mark_payment_verified(payment_id, user_id=sender_user_id or None):
-            bot.reply_to(message, "❌ No pude finalizar la verificación del pago.")
+            # Matched but not verified (transient DB error) -> non-green, relocate.
+            relocate_receipt_issue_to_topic(message, "❌ No pude finalizar la verificación del pago.")
             return
         keep_receipt_hash = True
 
