@@ -103,12 +103,15 @@ load-bearing (see §6, assumption A).
   fall back to a channel reply and skip deletion. Verify the try/except ordering
   (delete only after a successful send).
 
-## 7. Deploy prerequisites (operational, not code)
-1. Bot must be **admin of the channel `-1003765331250` with "Delete messages"** —
-   else the topic copy still happens but the original cannot be removed (logs a
-   warning, leaves it in the channel).
+## 7. Deploy prerequisites (operational, not code) — HARD GATES
+1. **DEPLOY GATE:** the bot must be an **admin of the channel `-1003765331250` with the
+   "Delete messages" right** — otherwise the topic copy still happens but the original
+   stays in the channel (the runtime logs a warning naming this exact permission). Without
+   it the "move" degrades to a "copy", leaving duplicates. Confirm it is granted.
 2. Bot must be able to **post in topic `47362`** of group `-1003595738966`.
-3. Set the two `.env` vars; restart the bot.
+3. Set the two `.env` vars (`RECEIPT_ISSUES_GROUP_ID`, `RECEIPT_ISSUES_TOPIC_ID`); a
+   blank/garbage value no longer crashes startup (falls back to the default + logs).
+   Restart the bot.
 
 ## 8. How to review
 ```
@@ -134,16 +137,13 @@ Manual scenarios (against a test channel/group):
 Status legend: ✅ fixed in working tree · ⬜ open / decision needed · ❌ false positive.
 
 ### Must address before merge
-- **1. ⬜ Scope creep — premios change bundled.** The diff also contains a pre-existing
-  premios auth rewrite (`ADMIN_USER_IDS` / `can_manage_premios` / `save_results` gate)
-  and report chunking (`_send_premios_report_chunk`), unrelated to receipts and **not
-  authored by this feature**. → Split into its own commit/PR. *(Owner decision.)*
-- **2. ⬜ Latent admin lockout in that bundled change.** `ADMIN_USER_IDS` defaults to an
-  **empty set** with no fallback to legacy `ADMIN_USER_ID`; combined with the new
-  `save_results`/`/premios`/`admin_menu` gates, an empty/unset value locks out everyone
-  incl. the super-admin. **Not live today** (current `.env` populates it), and **not part
-  of the receipt feature** — fix it within the premios PR: `ADMIN_USER_IDS = {…} |
-  ({ADMIN_USER_ID} if ADMIN_USER_ID else set())`, and add an `.env.example` entry.
+- **1. ✅ Scope split done.** The premios change is now its own commit (`baedd7e`),
+  separate from the receipt feature (`a40ee22` + hardening). Verified clean: each commit
+  contains zero of the other's tokens.
+- **2. ✅ Admin-lockout fallback applied** (in `baedd7e`). `ADMIN_USER_IDS` now always
+  folds in the legacy super-admin (`ADMIN_USER_ID`), so an empty/unset value cannot lock
+  everyone out of the results workflow. (No `.env.example` exists in this repo, so the var
+  is documented in the commit message instead.)
 - **3. ✅ Two non-green error edges no longer reply in-channel.** `handle_channel_photo`
   download-failure and `process_channel_ocr_task` `mark_payment_verified`-failure now go
   through `relocate_receipt_issue_to_topic` like every other non-green outcome.
@@ -152,25 +152,25 @@ Status legend: ✅ fixed in working tree · ⬜ open / decision needed · ❌ fa
 - **4. ✅ Incoherent `RECEIPT_ISSUES_TOPIC_ID = None` escape removed.** The
   `reply_to_user_topic` guard now requires `RECEIPT_ISSUES_TOPIC_ID is not None` and an
   exact thread match (the old `None or …` would have matched any topic).
-- **5. ⬜ Correction dies silently if `RECEIPT_ISSUES_GROUP_ID != ADMIN_GROUP_ID`.** Only
-  fires inside `is_admin_chat` (== `ADMIN_GROUP_ID`). Documented in the code comment at
-  the guard; **not** guarded by a startup warning. Acceptable while the two IDs are equal
-  (current config). → Optional: add a startup warning or a dedicated handler.
+- **5. ✅ Decoupled-group correction handled.** Added `handle_issues_topic_correction`,
+  a dedicated handler that fires when `RECEIPT_ISSUES_GROUP_ID != ADMIN_GROUP_ID`. Its
+  filter is mutually exclusive with the inline equal-group path, so corrections are never
+  processed twice and work regardless of which group hosts the issues topic.
 
 ### Minor / advisory
 - **6. ✅ `edit_status_text_or_caption` no longer over-broad.** Falls back to text only on
   a genuine "no caption" error, treats "not modified" as a no-op, and re-raises other
   errors instead of masking them behind a guaranteed second failure.
-- **7. ⬜ Topic send doesn't honor `429 retry-after`.** Diverges from the file's
-  `copy_message_with_retry` backoff. Degrades safely (receipt survives in channel, not
-  deleted). → Optional: reuse the retry helper for the topic send.
+- **7. ✅ Topic send now retries on `429 retry-after`.** `relocate_receipt_issue_to_topic`
+  wraps its send in `_telegram_send_with_retry`, mirroring `copy_message_with_retry`'s
+  flood-wait + exponential backoff.
 - **8. ❌ FALSE POSITIVE — "incomplete relocates without parse_mode".** The incomplete
   branch *does* pass `parse_mode="Markdown"`; verified in code. No action.
-- **9. ⬜ `int()` on a garbage `RECEIPT_ISSUES_*` env value crashes at import.** Consistent
-  with the file's existing env-parsing pattern; low risk. Not changed.
-- **10. ⬜ Operational:** bot must be a **channel admin with "Delete messages"** or
-  relocation leaves the original behind (topic copy + undeleted channel post). Confirm the
-  permission is actually granted (see §7).
+- **9. ✅ Env parse no longer crashes at import.** `RECEIPT_ISSUES_*` now parse via
+  `_safe_int_env`, which falls back to the default (and logs) on a blank/non-numeric value.
+- **10. ✅ Operational requirement made discoverable + documented as a deploy gate.** The
+  delete-failure log now names the required "Delete messages" admin right, and §7 lists it
+  as a hard prerequisite. (Still an operational gate — the bot must actually be granted it.)
 
 ### Independently confirmed sound (traced from the diff, not the narrative)
 Fail-safe delete-after-send ordering; pending-row points at the topic message so auto

@@ -159,8 +159,21 @@ YAPPY_PAYMENTS_GROUP_ID = int(os.getenv('YAPPY_PAYMENTS_GROUP_ID', 0)) if os.get
 RECEIPT_FORWARD_CHANNEL_ID = int(os.getenv('RECEIPT_FORWARD_CHANNEL_ID', 0)) if os.getenv('RECEIPT_FORWARD_CHANNEL_ID') else None
 # Where non-green ("issue") receipts forwarded to the channel are relocated to.
 # Defaults to the admin group; RECEIPT_ISSUES_TOPIC_ID is the forum topic thread id.
-RECEIPT_ISSUES_GROUP_ID = int(os.getenv('RECEIPT_ISSUES_GROUP_ID')) if os.getenv('RECEIPT_ISSUES_GROUP_ID') else ADMIN_GROUP_ID
-RECEIPT_ISSUES_TOPIC_ID = int(os.getenv('RECEIPT_ISSUES_TOPIC_ID')) if os.getenv('RECEIPT_ISSUES_TOPIC_ID') else None
+def _safe_int_env(name, default):
+    """int() an env var, falling back to default on a missing/blank/non-numeric
+    value instead of crashing the bot at import time."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except (TypeError, ValueError):
+        print(f"⚠️ Invalid integer for env {name}={raw!r}; using default {default}")
+        return default
+
+
+RECEIPT_ISSUES_GROUP_ID = _safe_int_env('RECEIPT_ISSUES_GROUP_ID', ADMIN_GROUP_ID)
+RECEIPT_ISSUES_TOPIC_ID = _safe_int_env('RECEIPT_ISSUES_TOPIC_ID', None)
 YAPPY_DIRECT_INGEST_ENABLED = os.getenv('YAPPY_DIRECT_INGEST_ENABLED', '0').strip().lower() in ('1', 'true', 'yes', 'on')
 MONEY_REQUEST_WARNING_GROUP_ID = int(os.getenv('MONEY_REQUEST_WARNING_GROUP_ID', -1003795391458))
 WEBAPP_BASE_URL = os.getenv('WEBAPP_BASE_URL', 'https://ansansan.github.io/LotTicket/test/')
@@ -4723,6 +4736,33 @@ def yappy_test_insert(message):
     except Exception as e:
         bot.reply_to(message, f"Error: {e}")
 
+# --- RECEIPT-ISSUES TOPIC CORRECTION (decoupled group) ---
+# When RECEIPT_ISSUES_GROUP_ID is a DIFFERENT group than ADMIN_GROUP_ID, the
+# admin-topic handler below (gated on is_admin_chat == ADMIN_GROUP_ID) never fires
+# there, so a 5-letter confirmation correction in the issues topic would be missed.
+# This dedicated handler covers that case; the equal-group case is handled inline
+# in reply_to_user_topic. The filters are mutually exclusive (group != vs ==), so a
+# correction is never processed twice.
+@bot.message_handler(
+    func=lambda m: bool(
+        RECEIPT_ISSUES_GROUP_ID
+        and str(RECEIPT_ISSUES_GROUP_ID) != str(ADMIN_GROUP_ID)
+        and RECEIPT_ISSUES_TOPIC_ID is not None
+        and str(m.chat.id) == str(RECEIPT_ISSUES_GROUP_ID)
+        and m.message_thread_id == RECEIPT_ISSUES_TOPIC_ID
+        and m.reply_to_message
+        and m.text and not m.text.startswith('/')
+    ),
+    content_types=['text']
+)
+def handle_issues_topic_correction(message):
+    """5-letter confirmation correction when the issues topic lives in a group
+    other than the admin group."""
+    try:
+        apply_confirmation_correction(message)
+    except Exception as e:
+        print(f"⚠️ Issue-topic correction failed: {e}")
+
 # --- SUPPORT REPLY HANDLER (Must be before debug handler) ---
 @bot.message_handler(func=lambda m: is_admin_chat(m) and m.message_thread_id, content_types=['text', 'photo', 'voice', 'sticker', 'video', 'document'])
 def reply_to_user_topic(message):
@@ -4736,10 +4776,10 @@ def reply_to_user_topic(message):
 
     # Receipt-issues topic: an admin replying with a 5-letter code corrects a
     # pending (blue) receipt's confirmation. Handle that before support mirroring.
-    # NOTE: this fires here because RECEIPT_ISSUES_GROUP_ID defaults to the admin
-    # group; if it is ever pointed at a different group, add a dedicated handler.
-    # Requires a configured topic id and an exact thread match — corrections are
-    # only meaningful inside the issues topic, never the group's General thread.
+    # NOTE: this inline path covers the common case where RECEIPT_ISSUES_GROUP_ID
+    # IS the admin group; the decoupled case (different group) is handled by
+    # handle_issues_topic_correction. Requires a configured topic id and an exact
+    # thread match — corrections are only meaningful inside the issues topic.
     try:
         if (message.text and message.reply_to_message
                 and RECEIPT_ISSUES_GROUP_ID
@@ -5320,6 +5360,26 @@ def process_ocr_task(message, temp_path, image_hash=None):
             pass
 
 
+def _telegram_send_with_retry(send_fn, max_retries=5):
+    """Run a Telegram send callable, retrying on a 429 'retry after N' flood wait
+    and transient API errors with the same backoff as copy_message_with_retry."""
+    delay = 0.5
+    for attempt in range(max_retries):
+        try:
+            return send_fn()
+        except Exception as e:
+            if attempt < max_retries - 1:
+                m = re.search(r'retry after\s+(\d+)', str(e), re.IGNORECASE)
+                if m:
+                    wait_s = int(m.group(1)) + 0.2
+                else:
+                    wait_s = delay
+                    delay = min(delay * 2, 5.0)
+                time.sleep(wait_s)
+                continue
+            raise
+
+
 def relocate_receipt_issue_to_topic(message, status_text, parse_mode=None):
     """
     Relocate a non-green ("issue") channel receipt to the receipt-issues topic.
@@ -5342,20 +5402,20 @@ def relocate_receipt_issue_to_topic(message, status_text, parse_mode=None):
     photo_variants = getattr(message, 'photo', None) or []
     try:
         if photo_variants:
-            sent = bot.send_photo(
+            sent = _telegram_send_with_retry(lambda: bot.send_photo(
                 RECEIPT_ISSUES_GROUP_ID,
                 photo=photo_variants[-1].file_id,
                 caption=status_text,
                 parse_mode=parse_mode,
                 message_thread_id=RECEIPT_ISSUES_TOPIC_ID
-            )
+            ))
         else:
-            sent = bot.send_message(
+            sent = _telegram_send_with_retry(lambda: bot.send_message(
                 RECEIPT_ISSUES_GROUP_ID,
                 status_text,
                 parse_mode=parse_mode,
                 message_thread_id=RECEIPT_ISSUES_TOPIC_ID
-            )
+            ))
     except Exception as e:
         print(f"⚠️ Failed to send receipt issue to topic: {e}")
         try:
@@ -5365,10 +5425,12 @@ def relocate_receipt_issue_to_topic(message, status_text, parse_mode=None):
             return None
 
     # Topic copy succeeded -> remove the original forwarded receipt from the channel.
+    # Requires the bot to be a channel admin with the "Delete messages" right.
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except Exception as e:
-        print(f"⚠️ Failed to delete original channel receipt {message.message_id}: {e}")
+        print(f"⚠️ Could not delete original channel receipt {message.message_id} "
+              f"(bot needs 'Delete messages' admin right in the channel): {e}")
 
     return sent
 
