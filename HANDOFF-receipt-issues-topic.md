@@ -113,6 +113,28 @@ load-bearing (see §6, assumption A).
    blank/garbage value no longer crashes startup (falls back to the default + logs).
    Restart the bot.
 
+### 7.1 Where it runs / how to deploy (deployment topology)
+- **Bot (this repo, `Ansansan/lot_ticket_test`):** runs on **PythonAnywhere**, account `tel`,
+  in `/home/tel/lot_ticket_test/`, as an **always-on task** with command
+  `cd /home/tel/lot_ticket_test && /home/tel/task_env/bin/python3 -u lot_ticket_test.py`
+  (virtualenv `/home/tel/task_env`). It uses **long polling** (`bot.infinity_polling`), not
+  webhooks. That directory is **not a git checkout** — it holds `lot_ticket_test.py`, `.env`,
+  `tickets_test.db`, `yappy_cache.db`, the `flag_*.png` assets, and `__pycache__/`.
+- **Update procedure:** (1) land the code on `main`; (2) put the new `lot_ticket_test.py` in
+  `/home/tel/lot_ticket_test/` — Files → "Upload a file" (overwrites) or pull it in a Bash
+  console — and **do not touch `.env` or the `.db` files** (they are prod state); (3) set/confirm
+  the `.env` keys above; (4) **restart the always-on task** (`.env` is read only at startup). The
+  receipt feature needs **no DB migration and no new pip deps**.
+- **Frontend (also this repo):** `index.html`, `script_v10.js`, `style_v10.css` are published via
+  **GitHub Pages** (branch `main`, root) at **https://ansansan.github.io/lot_ticket_test/**, which
+  is the value `.env` sets for `WEBAPP_BASE_URL`. ⚠️ The code *default* for `WEBAPP_BASE_URL`
+  (`https://ansansan.github.io/LotTicket/test/`) is **stale and 404s** — the live URL works only
+  because `.env` overrides it. Frontend changes deploy by pushing to `main` (Pages auto-publishes);
+  no PythonAnywhere step.
+- **History API:** `HISTORY_API_BASE` (`.env`) points at
+  `https://tel.pythonanywhere.com/lot_ticket_dadan/` — a **separate** PythonAnywhere web app, not
+  the bot's always-on task.
+
 ## 8. How to review
 ```
 cd "lot ticket bot test"
