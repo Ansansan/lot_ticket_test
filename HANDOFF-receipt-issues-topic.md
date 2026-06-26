@@ -204,3 +204,55 @@ payout math). New edge findings — now fixed in `a` (this pass):
   only manual 5-letter correction is inert when no topic is configured.
 - **F. ✅ Comment corrected** re: the two correction handlers being resolved by registration
   order in the super-admin-user edge (not purely disjoint filters).
+
+### Third review pass (local max-effort, 8 multi-agent finders + manual source verification)
+Run 2026-06-26 against head `fb38ecb` (the committed branch). **Verdict: no blockers in the
+receipt feature** — independently confirms the §10/§11 passes. No CLAUDE.md governs the repo,
+so no convention findings. Decision: **report only, no code changes applied** (per requester).
+Status legend as before; **🟢 ACCEPT** = real but intentionally not fixed.
+
+In-scope (receipt) findings:
+- **R1. 🟢 ACCEPT (latent, would only bite a decoupled config).** `handle_photo_verification`
+  (`:4889`) ignores only `ADMIN_GROUP_ID`/Yappy group. If `RECEIPT_ISSUES_GROUP_ID` were ever
+  pointed at a *different* group, an admin posting a photo there would be OCR'd as a fresh
+  submission. No-op in the live config (issues group == admin group, already ignored). Cheap
+  1-line guard available if the issues topic is ever decoupled.
+- **R2. 🟢 ACCEPT (rare fallback path).** Green-confirmation fallback (`:2935`) calls
+  `mirror_to_topic(chat_id, …)` with `chat_id` = issues group; when it equals `ADMIN_GROUP_ID`
+  (default) this self-mirrors a message already in the admin group. Only fires when the
+  caption-edit fallback triggers. Same pattern existed pre-feature (channel id was passed there).
+- **R3. 🟢 ACCEPT.** `_telegram_send_with_retry` (`:5377`) can re-post a non-idempotent
+  `send_photo` on a 429/post-success network error → duplicate topic photo. Matches existing
+  `copy_message_with_retry` behavior; rare.
+- **R4. 🟢 ACCEPT (total-outage edge).** If topic send AND channel fallback both fail, `relocate`
+  returns `None` → pending row gets `reply_message_id=None` → later green posts bare in channel.
+  Original is not deleted (delete only after a confirmed send), so nothing is lost.
+- **R5. ⬜ LATENT/ADVISORY.** `edit_status_text_or_caption` (`:2811`) and
+  `_looks_like_markdown_send_error` switch on Telegram's English error prose. Correct against
+  today's strings; would break silently if Telegram rewords. Deeper fix = record blue-message
+  kind (photo/text) on the pending row instead of probing via a guaranteed-to-fail edit.
+- **R6. ⬜ ADVISORY (altitude).** Three correction paths gated partly by handler registration
+  order; documented in-code, the one overlap resolved by order. Works; brittle to reordering.
+- **R7. Pre-existing, not introduced.** `apply_confirmation_correction` (`:4960`) commits the
+  corrected code before verify; on `mark_payment_verified` failure it returns True leaving a
+  corrected-but-unverified row (self-heals on later auto-match). Identical to the old handler.
+
+Premios-side (commit `baedd7e` — separately owned, out of scope for this handoff):
+- **P1.** Authorization tightened to an `ADMIN_USER_IDS` allowlist; non-allowlisted group
+  members and anonymous (send-as-group) admins lose `/premios`/`admin_menu`/`save_results`.
+  Intentional; super-admin fallback in place. **Owner action:** ensure `ADMIN_USER_IDS` lists
+  every staffer who needs it.
+- **P2.** `can_manage_premios(message.from_user.id)` derefs `from_user` at the call site (None
+  for anonymous admins) before its own try/except. Pre-existing pattern (old `is_admin_chat`).
+- **P3.** `ADMIN_USER_IDS` `.isdigit()` silently drops `+`/`-`/space entries (no warning).
+- **P4.** Chunked `calculate_and_report` uses a fragile `current_chunk == header_section`
+  identity check + parallel footer branches. No content loss found; could simplify.
+
+False positives refuted this pass (do not re-chase):
+- "Incomplete branch missing `parse_mode`" — false, passes `parse_mode="Markdown"` (`:5546`).
+- "Money-request alert now fires for everyone" — false, both old branches called it identically;
+  the hoist is behavior-preserving.
+- "`reply_to_user_topic` leaks an admin reply to a user on a non-matched correction" — false,
+  it `return`s when the thread is not a registered support thread (`:4811`).
+- "Matched-but-unverified relocate loses the receipt/hash" — false, hash is released so a
+  re-forward reprocesses (same as old code); the error is visible in the topic.
