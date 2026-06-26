@@ -113,6 +113,11 @@ load-bearing (see §6, assumption A).
    blank/garbage value no longer crashes startup (falls back to the default + logs).
    Restart the bot.
 
+### 7.1 Where it runs / how to deploy
+See **`CLAUDE.md` → "Deployment"** for the full topology (PythonAnywhere always-on task at
+`/home/tel/lot_ticket_test/`, upload-`lot_ticket_test.py`-then-restart, frontend on GitHub
+Pages, `HISTORY_API_BASE` as a separate app, and the stale `WEBAPP_BASE_URL` default gotcha).
+
 ## 8. How to review
 ```
 cd "lot ticket bot test"
